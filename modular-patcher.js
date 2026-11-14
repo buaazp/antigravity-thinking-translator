@@ -1,6 +1,7 @@
 'use strict';
 
 const vm = require('vm');
+const { PLUGIN_VERSION } = require('./tt-core');
 
 const TAGS = {
   UTILS_START: '// --- Antigravity Thinking Translator utils Injection Start ---',
@@ -86,9 +87,11 @@ function generatePreloadSnippet() {
     '',
     TAGS.PRELOAD_START,
     'electron_1.contextBridge.exposeInMainWorld("thinkingTranslatorAPI", {',
+    `  version: ${JSON.stringify(PLUGIN_VERSION)},`,
     '  getSettings: () => electron_1.ipcRenderer.invoke("thinking-translator:get-settings"),',
     '  saveSettings: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:save-settings", payload),',
     '  listModels: (opts) => electron_1.ipcRenderer.invoke("thinking-translator:list-models", opts),',
+    '  checkCache: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:check-cache", payload),',
     '  translate: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:translate", payload),',
     '  clearCache: () => electron_1.ipcRenderer.invoke("thinking-translator:clear-cache"),',
     '  getStatus: () => electron_1.ipcRenderer.invoke("thinking-translator:status"),',

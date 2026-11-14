@@ -95,3 +95,82 @@ test('renderSafeMarkdownHtml escapes HTML XSS and formats markdown elements', ()
   assert.ok(html.includes('<ul class="ag-tt-list"><li>Item one</li><li>Item two</li></ul>'));
   assert.ok(html.includes('<pre class="ag-tt-code-block" data-lang="js"><code>const x = &quot;&lt;img&gt;&quot;;</code></pre>'));
 });
+
+test('groupModelsForCascade and resolveCascadeSelection support two-level cascading dropdowns', () => {
+  const groups = core.groupModelsForCascade(core.FALLBACK_MODELS);
+  assert.ok(groups.length >= 8);
+  assert.equal(groups[0].baseLabel, 'Gemini 4 Hydrogen');
+  assert.deepEqual(
+    groups[0].options.map(o => o.levelRaw),
+    ['Low', 'Medium', 'High', 'XHigh']
+  );
+
+  // Initial resolution selects default Gemini 4 Hydrogen (Medium)
+  const initial = core.resolveCascadeSelection(groups, 'gemini-4-hydrogen-medium');
+  assert.equal(initial.baseKey, 'gemini-4-hydrogen');
+  assert.equal(initial.levelKey, 'medium');
+  assert.equal(initial.modelId, 'gemini-4-hydrogen-medium');
+
+  // Switching base model keeps preferred level 'High' when supported
+  const toFlashKeepHigh = core.resolveCascadeSelection(groups, initial.modelId, 'gemini-3.8-flash', 'high');
+  assert.equal(toFlashKeepHigh.modelId, 'gemini-3.8-flash-high');
+  assert.deepEqual(
+    toFlashKeepHigh.group.options.map(o => o.levelRaw),
+    ['Low', 'Medium', 'High']
+  );
+
+  // Switching from XHigh to a model without XHigh falls back cleanly to Medium
+  const toSonnetFallback = core.resolveCascadeSelection(groups, 'gemini-4-hydrogen-xhigh', 'claude-sonnet-5.5', 'xhigh');
+  assert.equal(toSonnetFallback.modelId, 'claude-sonnet-5-5-medium');
+
+  // Orchestrator uses Carbon / Argon variants; GPT-OSS has Medium
+  const toOrchestrator = core.resolveCascadeSelection(groups, initial.modelId, 'orchestrator', 'medium');
+  assert.deepEqual(toOrchestrator.group.options.map(o => o.levelRaw), ['Carbon', 'Argon']);
+  assert.equal(toOrchestrator.modelId, 'gemini-pro-orchestrator');
+});
+
+test('computeCanonicalCacheKey matches raw Markdown against stripped DOM text', () => {
+  const rawMd = '### Inspecting `tt-core.js`\nLet us **check** `bytedance.net` and `en0`.';
+  const domText = 'Inspecting tt-core.js\nLet us check bytedance.net and en0.';
+
+  const kMd = core.computeCanonicalCacheKey(rawMd, '简体中文', 'gemini-4-hydrogen-medium');
+  const kDom = core.computeCanonicalCacheKey(domText, '简体中文', 'gemini-4-hydrogen-medium');
+  const kOtherLang = core.computeCanonicalCacheKey(domText, '日本語', 'gemini-4-hydrogen-medium');
+
+  assert.equal(kMd, kDom);
+  assert.notEqual(kMd, kOtherLang);
+});
+
+test('splitMarkdownIntoBlocks splits prose paragraphs while keeping fenced code blocks intact', () => {
+  const md = [
+    'First paragraph analyzing `main.js`.',
+    '',
+    '```js',
+    'const a = 1;',
+    '',
+    'const b = 2;',
+    '```',
+    '',
+    '---',
+    '',
+    '- Bullet one',
+    '- Bullet two'
+  ].join('\n');
+
+  const blocks = core.splitMarkdownIntoBlocks(md);
+  assert.deepEqual(blocks.map(b => b.type), ['prose', 'code', 'hr', 'prose']);
+  assert.equal(blocks[0].text, 'First paragraph analyzing `main.js`.');
+  assert.ok(blocks[1].text.includes('const b = 2;'));
+  assert.equal(blocks[3].text, '- Bullet one\n- Bullet two');
+});
+
+test('renderStreamingMarkdownHtml safely adds token fade span and streaming caret', () => {
+  const html = core.renderStreamingMarkdownHtml('正在分析代码库并<script>', 4, true);
+  assert.ok(!html.includes('<script>'));
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.ok(html.includes('ag-tt-token-in'));
+  assert.ok(html.includes('ag-tt-stream-caret'));
+
+  const finalHtml = core.renderStreamingMarkdownHtml('正在分析代码库', 4, false);
+  assert.ok(!finalHtml.includes('ag-tt-stream-caret'));
+});

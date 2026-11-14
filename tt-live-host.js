@@ -14,7 +14,7 @@ const {
 } = require('./tt-backend');
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const ALLOWED_ROUTES = ['/get-settings', '/save-settings', '/list-models', '/clear-cache', '/status', '/translate'];
+const ALLOWED_ROUTES = ['/get-settings', '/save-settings', '/list-models', '/check-cache', '/clear-cache', '/status', '/translate'];
 
 async function detectLiveOrigin() {
   const port = getDevToolsPort();
@@ -114,6 +114,12 @@ async function startLiveHost(options = {}) {
       }
       if (req.url === '/list-models') {
         const result = await listAvailableModels({ stateDir, agyPath: options.agyPath, force: Boolean(payload.force) });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+      if (req.url === '/check-cache') {
+        const result = service.checkCache(payload || {});
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
         return;

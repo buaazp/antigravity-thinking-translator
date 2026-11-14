@@ -19,6 +19,7 @@ const {
   getEffectiveTargetLang,
   normalizeThinkingText,
   computeCacheKey,
+  computeCanonicalCacheKey,
   buildTranslationPrompt,
   cleanModelTranslationOutput,
   parseAgyModelsOutput
@@ -31,6 +32,7 @@ const TURN_TIMEOUT_MS = 90 * 1000;
 const MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 const LONG_TEXT_THRESHOLD = 5500;
 const CHUNK_MAX_CHARS = 4200;
+const DEFAULT_MAX_CONCURRENCY = 4;
 
 function buildAugmentedPath() {
   const home = process.env.USERPROFILE || os.homedir();
@@ -155,6 +157,7 @@ class TranslationCache {
     this.filePath = path.join(this.stateDir, 'translation-cache.json');
     this.maxEntries = Number(options.maxEntries) > 0 ? Number(options.maxEntries) : MAX_CACHE_ENTRIES;
     this.map = new Map();
+    this.canonicalIndex = new Map();
     this._loaded = false;
   }
 
@@ -166,6 +169,9 @@ class TranslationCache {
       for (const item of raw.entries) {
         if (item && typeof item.key === 'string' && typeof item.translation === 'string') {
           this.map.set(item.key, item);
+          if (typeof item.canonicalKey === 'string' && item.canonicalKey) {
+            this.canonicalIndex.set(item.canonicalKey, item.key);
+          }
         }
       }
       this._prune();
@@ -176,14 +182,18 @@ class TranslationCache {
     while (this.map.size > this.maxEntries) {
       const oldestKey = this.map.keys().next().value;
       if (oldestKey === undefined) break;
+      const oldest = this.map.get(oldestKey);
       this.map.delete(oldestKey);
+      if (oldest && oldest.canonicalKey && this.canonicalIndex.get(oldest.canonicalKey) === oldestKey) {
+        this.canonicalIndex.delete(oldest.canonicalKey);
+      }
     }
   }
 
   _save() {
     try {
       writeJsonAtomic(this.filePath, {
-        version: 1,
+        version: 2,
         updatedAt: new Date().toISOString(),
         entries: Array.from(this.map.values())
       });
@@ -200,17 +210,63 @@ class TranslationCache {
     return entry;
   }
 
+  lookup(text, targetLang, model) {
+    this._ensureLoaded();
+    const exactKey = computeCacheKey(text, targetLang, model);
+    const exactHit = this.get(exactKey);
+    if (exactHit) return exactHit;
+
+    const canonKey = computeCanonicalCacheKey(text, targetLang, model);
+    const mappedKey = this.canonicalIndex.get(canonKey);
+    if (mappedKey) {
+      const canonHit = this.get(mappedKey);
+      if (canonHit) return canonHit;
+      this.canonicalIndex.delete(canonKey);
+    }
+    return null;
+  }
+
+  checkBatch(items, targetLang, model) {
+    this._ensureLoaded();
+    const hits = {};
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (!item || typeof item.id !== 'string' || typeof item.text !== 'string' || !item.text.trim()) continue;
+        const entry = this.lookup(item.text, targetLang, model);
+        if (entry && typeof entry.translation === 'string') {
+          hits[item.id] = entry.translation;
+        }
+      }
+    }
+    return {
+      ok: true,
+      hits,
+      cacheStats: this.stats()
+    };
+  }
+
   set(key, value) {
     this._ensureLoaded();
+    const canonicalKey = value.canonicalKey || '';
+    if (canonicalKey) {
+      const prevKey = this.canonicalIndex.get(canonicalKey);
+      if (prevKey && prevKey !== key) {
+        this.map.delete(prevKey);
+      }
+    }
     if (this.map.has(key)) this.map.delete(key);
     this.map.set(key, {
       key,
+      canonicalKey,
       translation: value.translation,
       targetLang: value.targetLang,
       model: value.model,
       updatedAt: Date.now(),
       lastAccessAt: Date.now()
     });
+    if (canonicalKey) {
+      this.canonicalIndex.set(canonicalKey, key);
+    }
     this._prune();
     this._save();
   }
@@ -218,6 +274,7 @@ class TranslationCache {
   clear() {
     this._loaded = true;
     this.map.clear();
+    this.canonicalIndex.clear();
     this._save();
     return { ok: true, count: 0 };
   }
@@ -354,6 +411,7 @@ class WarmAgyWorker {
     this.rl = null;
     this.tmpDir = null;
     this.turns = 0;
+    this.busy = false;
     this.closing = false;
     this.activeTurn = null;
     this.idleTimer = null;
@@ -532,17 +590,78 @@ class AgyTranslationService {
     this.sandbox = options.sandbox !== false;
     this.turnTimeoutMs = options.turnTimeoutMs || TURN_TIMEOUT_MS;
     this.idleMs = options.idleMs || WORKER_IDLE_MS;
+    this.maxConcurrency = Math.max(1, Number(options.maxConcurrency) || DEFAULT_MAX_CONCURRENCY);
     this.cache = new TranslationCache({ stateDir: this.stateDir, maxEntries: options.maxCacheEntries });
     this.inflight = new Map();
-    this.queue = Promise.resolve();
-    this.worker = null;
+    this.workers = [];
+    this.waiters = [];
     this.disposed = false;
   }
 
-  _enqueue(fn) {
-    const task = this.queue.then(fn, fn);
-    this.queue = task.catch(() => {});
-    return task;
+  _removeWorker(worker) {
+    const idx = this.workers.indexOf(worker);
+    if (idx !== -1) this.workers.splice(idx, 1);
+  }
+
+  _cleanupDeadWorkers() {
+    for (let i = this.workers.length - 1; i >= 0; i--) {
+      const w = this.workers[i];
+      if (!w.busy && (w.closing || (w.child && (w.child.killed || w.child.exitCode !== null)) || w.turns >= WORKER_MAX_TURNS)) {
+        this.workers.splice(i, 1);
+        try { w.close(); } catch {}
+      }
+    }
+  }
+
+  async _acquireWorker(agyPath, model) {
+    while (true) {
+      if (this.disposed) throw new Error('Service disposed');
+      this._cleanupDeadWorkers();
+
+      // 1. Prefer reusing an idle warm worker with matching model
+      const reusable = this.workers.find(w => !w.busy && w.isReusable(model));
+      if (reusable) {
+        reusable.busy = true;
+        return reusable;
+      }
+
+      // 2. Retire any idle worker for a different model before spawning a fresh one
+      const diffIdle = this.workers.find(w => !w.busy && w.model !== model);
+      if (diffIdle) {
+        this._removeWorker(diffIdle);
+        try { diffIdle.close(); } catch {}
+      }
+
+      // 3. Spawn a new worker if within pool capacity
+      if (this.workers.length < this.maxConcurrency) {
+        const worker = new WarmAgyWorker({
+          agyPath,
+          model,
+          sandbox: this.sandbox,
+          turnTimeoutMs: this.turnTimeoutMs,
+          idleMs: this.idleMs
+        });
+        worker.busy = true;
+        this.workers.push(worker);
+        return worker;
+      }
+
+      // 4. Wait until a worker finishes its turn and frees a slot
+      await new Promise((resolve, reject) => {
+        this.waiters.push({ resolve, reject });
+      });
+    }
+  }
+
+  _releaseWorker(worker) {
+    if (!worker) return;
+    worker.busy = false;
+    if (this.disposed || worker.closing || (worker.child && (worker.child.killed || worker.child.exitCode !== null)) || worker.turns >= WORKER_MAX_TURNS) {
+      this._removeWorker(worker);
+      try { worker.close(); } catch {}
+    }
+    const next = this.waiters.shift();
+    if (next) next.resolve();
   }
 
   async _runOneShot(agyPath, model, prompt) {
@@ -579,30 +698,14 @@ class AgyTranslationService {
 
   async _translateSingleChunk(agyPath, model, targetLang, chunkText, onChunkDelta) {
     const prompt = buildTranslationPrompt(chunkText, targetLang);
-    return this._enqueue(async () => {
-      if (this.disposed) throw new Error('Service disposed');
-      if (!this.worker || !this.worker.isReusable(model)) {
-        if (this.worker) {
-          this.worker.close();
-          this.worker = null;
-        }
-        this.worker = new WarmAgyWorker({
-          agyPath,
-          model,
-          sandbox: this.sandbox,
-          turnTimeoutMs: this.turnTimeoutMs,
-          idleMs: this.idleMs
-        });
-      }
-
+    const worker = await this._acquireWorker(agyPath, model);
+    try {
       try {
-        const raw = await this.worker.runTurn(prompt, onChunkDelta);
+        const raw = await worker.runTurn(prompt, onChunkDelta);
         return cleanModelTranslationOutput(raw, chunkText);
       } catch (err) {
-        if (this.worker) {
-          this.worker.close();
-          this.worker = null;
-        }
+        this._removeWorker(worker);
+        try { worker.close(); } catch {}
         // One-shot fallback for models or environments where stream-json fails
         const raw = await this._runOneShot(agyPath, model, prompt);
         if (typeof onChunkDelta === 'function') {
@@ -610,7 +713,16 @@ class AgyTranslationService {
         }
         return cleanModelTranslationOutput(raw, chunkText);
       }
-    });
+    } finally {
+      this._releaseWorker(worker);
+    }
+  }
+
+  checkCache(request = {}) {
+    const currentSettings = getSettings({ stateDir: this.stateDir }).settings;
+    const targetLang = String(request.targetLang || getEffectiveTargetLang(currentSettings)).trim() || '简体中文';
+    const model = String(request.model || currentSettings.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+    return this.cache.checkBatch(request.items || [], targetLang, model);
   }
 
   async translate(request = {}) {
@@ -629,33 +741,36 @@ class AgyTranslationService {
     const force = request.force === true;
     const onProgress = typeof request.onProgress === 'function' ? request.onProgress : null;
     const cacheKey = computeCacheKey(text, targetLang, model);
+    const canonicalKey = computeCanonicalCacheKey(text, targetLang, model);
 
     if (!force) {
-      const cached = this.cache.get(cacheKey);
+      const cached = this.cache.lookup(text, targetLang, model);
       if (cached) {
         return {
           ok: true,
           cacheKey,
+          canonicalKey,
           translation: cached.translation,
           model,
           targetLang,
           cached: true
         };
       }
+
+      if (this.inflight.has(canonicalKey)) {
+        const existing = this.inflight.get(canonicalKey);
+        if (onProgress) existing.listeners.add(onProgress);
+        return existing.promise;
+      }
     }
 
-    if (this.inflight.has(cacheKey)) {
-      const existing = this.inflight.get(cacheKey);
-      if (onProgress) existing.listeners.add(onProgress);
-      return existing.promise;
-    }
-
+    const inflightKey = force ? `force:${cacheKey}:${Date.now()}:${Math.random()}` : canonicalKey;
     const listeners = new Set();
     if (onProgress) listeners.add(onProgress);
 
     const agy = resolveAgyExecutable(this.agyPathOverride);
     if (!agy.ok) {
-      return { ok: false, cacheKey, error: agy.error };
+      return { ok: false, cacheKey, canonicalKey, error: agy.error };
     }
 
     const promise = (async () => {
@@ -669,18 +784,19 @@ class AgyTranslationService {
           const cleanedPartial = cleanModelTranslationOutput(partial, chunk);
           const fullPartial = prefix + cleanedPartial;
           for (const cb of listeners) {
-            try { cb({ cacheKey, text: fullPartial, chunkIndex: i, totalChunks: chunks.length }); } catch {}
+            try { cb({ cacheKey, canonicalKey, text: fullPartial, chunkIndex: i, totalChunks: chunks.length }); } catch {}
           }
         });
         translatedChunks.push(translated);
         const progressText = translatedChunks.join('\n\n');
         for (const cb of listeners) {
-          try { cb({ cacheKey, text: progressText, chunkIndex: i, totalChunks: chunks.length }); } catch {}
+          try { cb({ cacheKey, canonicalKey, text: progressText, chunkIndex: i, totalChunks: chunks.length }); } catch {}
         }
       }
 
       const finalTranslation = translatedChunks.join('\n\n').trim();
       this.cache.set(cacheKey, {
+        canonicalKey,
         translation: finalTranslation,
         targetLang,
         model
@@ -689,6 +805,7 @@ class AgyTranslationService {
       return {
         ok: true,
         cacheKey,
+        canonicalKey,
         translation: finalTranslation,
         model,
         targetLang,
@@ -697,20 +814,25 @@ class AgyTranslationService {
     })().catch(err => ({
       ok: false,
       cacheKey,
+      canonicalKey,
       error: err?.message || String(err)
     })).finally(() => {
-      this.inflight.delete(cacheKey);
+      this.inflight.delete(inflightKey);
     });
 
-    this.inflight.set(cacheKey, { promise, listeners });
+    this.inflight.set(inflightKey, { promise, listeners });
     return promise;
   }
 
   dispose() {
     this.disposed = true;
-    if (this.worker) {
-      this.worker.close();
-      this.worker = null;
+    while (this.waiters.length) {
+      const w = this.waiters.shift();
+      try { w.reject(new Error('Service disposed')); } catch {}
+    }
+    while (this.workers.length) {
+      const worker = this.workers.pop();
+      try { worker.close(); } catch {}
     }
   }
 }

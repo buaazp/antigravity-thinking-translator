@@ -19,17 +19,28 @@
     normalizeSettings,
     getEffectiveTargetLang,
     normalizeThinkingText,
-    computeCacheKey,
+    computeCanonicalCacheKey,
+    splitMarkdownIntoBlocks,
+    groupModelsForCascade,
+    resolveCascadeSelection,
     shouldTranslateText,
-    renderSafeMarkdownHtml
+    renderSafeMarkdownHtml,
+    renderStreamingMarkdownHtml,
+    escapeHtml
   } = core;
 
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
   const HOST_ID = 'ag-thinking-translator';
-  const LIVE_STREAM_PAUSE_MS = 1800;
+  const LIVE_STREAM_PAUSE_MS = 1400;
+  const STREAM_FRAME_INTERVAL_MS = 32;
+  const MAX_ACTIVE_REQUESTS = 4;
+  const MAX_BG_REQUESTS = 2;
+  const SCHEDULER_DEQUEUE_SCAN_MS = 10;
+  const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
   let models = FALLBACK_MODELS.slice();
+  let preferredLevelKey = resolveCascadeSelection(groupModelsForCascade(models), settings.model).levelKey || 'medium';
   let cacheCount = 0;
   let disposed = false;
   let popoverOpen = false;
@@ -37,17 +48,33 @@
   let lastErrorMsg = '';
   let scanTimer = 0;
   let pollTimer = 0;
+  let rafId = 0;
+  let lastAnimTick = 0;
   let themeObserver = null;
   let domObserver = null;
   let titlebarResizeObserver = null;
   let observedTitlebar = null;
   let docClickHandler = null;
   let reqSeq = 0;
+  let initialScanDone = false;
 
-  // WeakMap<wrapperDiv, BlockState>
+  // Wrapper & paragraph state tracking
   const blockStates = new WeakMap();
   const trackedWrappers = new Set();
-  const activeTranslateKeys = new Map(); // cacheKey -> Set<wrapper>
+  const seenToolGroups = new WeakMap(); // buttonEl -> last thinking fingerprint
+  const historicalToolGroups = new WeakSet();
+  const toolGroupStates = new WeakMap(); // buttonEl -> Array<FiberBlockState>
+
+  // Client-side canonical memory cache (canonKey -> translation) & negative check cache
+  const memCache = new Map();
+  const checkedCanonMisses = new Set();
+
+  // Priority concurrent translation scheduler
+  let activeHighCount = 0;
+  let activeBgCount = 0;
+  const highQueue = [];
+  const bgQueue = [];
+  const activeTasks = new Map(); // taskKey -> Task
 
   /* @INSERT_STYLES_AND_TEMPLATE */
 
@@ -60,14 +87,20 @@
   const el = id => shadow.getElementById(id);
 
   // =========================================================================
-  // Transport Bridge: Electron preload IPC or Live CDP HTTP NDJSON Bridge
+  // Transport Bridge: Electron Preload IPC or Live CDP HTTP NDJSON Bridge
   // =========================================================================
-  function getIpcApi() {
-    return typeof window !== 'undefined' && window.thinkingTranslatorAPI ? window.thinkingTranslatorAPI : null;
-  }
-
   function getLiveInfo() {
     return typeof window !== 'undefined' && window.__AGThinkingTranslatorLive ? window.__AGThinkingTranslatorLive : null;
+  }
+
+  function getIpcApi() {
+    const ipc = typeof window !== 'undefined' && window.thinkingTranslatorAPI ? window.thinkingTranslatorAPI : null;
+    if (!ipc) return null;
+    const live = getLiveInfo();
+    if (live && live.version === PLUGIN_VERSION && ipc.version !== PLUGIN_VERSION) {
+      return null;
+    }
+    return ipc;
   }
 
   async function callBridge(route, payload = {}) {
@@ -76,6 +109,7 @@
       if (route === '/get-settings') return ipc.getSettings();
       if (route === '/save-settings') return ipc.saveSettings(payload);
       if (route === '/list-models') return ipc.listModels(payload);
+      if (route === '/check-cache' && typeof ipc.checkCache === 'function') return ipc.checkCache(payload);
       if (route === '/clear-cache') return ipc.clearCache();
       if (route === '/status') return ipc.getStatus();
     }
@@ -165,28 +199,32 @@
   }
 
   // =========================================================================
-  // Global Page CSS (React-Safe Sibling Styling)
+  // Global Page CSS (Zero-[role="group"] Oscillation, One-Time Injection)
   // =========================================================================
   function ensureGlobalStyles() {
-    if (!document.head) return;
-    let styleEl = document.getElementById(GLOBAL_STYLE_ID);
-    if (!styleEl) {
-      styleEl = document.createElement('style');
-      styleEl.id = GLOBAL_STYLE_ID;
-      document.head.appendChild(styleEl);
-    }
+    if (!document.head || document.getElementById(GLOBAL_STYLE_ID)) return;
+    const styleEl = document.createElement('style');
+    styleEl.id = GLOBAL_STYLE_ID;
     styleEl.textContent = `
-      [role="group"][data-ag-tt-hide-orig="1"] > div:first-child:not([data-ag-tt-card]) {
+      [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"][data-ag-tt-active="1"] > button[data-testid="thinking-collapsible-trigger"] + div.overflow-y-auto {
+        max-height: 360px !important;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] [data-markdown-root] > [data-ag-tt-orig-ready="1"],
+      [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] .ag-tt-fallback-root > [data-ag-tt-orig-ready="1"] {
         display: none !important;
       }
-      html[data-ag-tt-expand="1"] [role="group"][data-ag-tt-has-card="1"] {
-        max-height: 440px !important;
-      }
-      .ag-tt-trigger-badge {
+      .ag-tt-trigger-bar {
         position: absolute;
-        top: 6px;
-        right: 28px;
+        top: 5px;
+        right: 26px;
         z-index: 2;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        user-select: none;
+      }
+      .ag-tt-mini-btn,
+      .ag-tt-trigger-badge {
         display: inline-flex;
         align-items: center;
         gap: 4px;
@@ -195,12 +233,22 @@
         font-size: 11px;
         line-height: 1.3;
         font-weight: 500;
-        background: rgba(99, 102, 241, 0.12);
-        color: #6366f1;
-        border: 1px solid rgba(99, 102, 241, 0.25);
         cursor: pointer;
         user-select: none;
         backdrop-filter: blur(4px);
+        border: 1px solid rgba(99, 102, 241, 0.24);
+        background: rgba(99, 102, 241, 0.11);
+        color: #6366f1;
+      }
+      .ag-tt-mini-btn {
+        background: rgba(128, 128, 128, 0.08);
+        border-color: rgba(128, 128, 128, 0.24);
+        color: inherit;
+        opacity: 0.78;
+      }
+      .ag-tt-mini-btn:hover {
+        opacity: 1;
+        border-color: #6366f1;
       }
       html.dark .ag-tt-trigger-badge,
       body.dark .ag-tt-trigger-badge,
@@ -222,94 +270,73 @@
         border-color: rgba(239, 68, 68, 0.28);
       }
       .ag-tt-trigger-badge[data-status="idle"] {
-        opacity: 0.78;
+        opacity: 0.8;
       }
       @keyframes agTtPulse {
         0%, 100% { opacity: 1; }
-        50% { opacity: 0.55; }
+        50% { opacity: 0.58; }
       }
-      .ag-tt-card {
-        margin: 8px 0 4px 8px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        border: 1px solid rgba(99, 102, 241, 0.22);
-        background: rgba(99, 102, 241, 0.05);
-        font-size: 13px;
+      @keyframes agTtTokenFade {
+        from { opacity: 0.12; }
+        to { opacity: 1; }
+      }
+      @keyframes agTtCaretBlink {
+        0%, 49% { opacity: 0.9; }
+        50%, 100% { opacity: 0.18; }
+      }
+      .ag-tt-para-trans {
+        overflow-anchor: none;
+        word-break: break-word;
+        font-size: 13.5px;
         line-height: 1.6;
         color: inherit;
       }
-      html.dark .ag-tt-card,
-      body.dark .ag-tt-card {
-        background: rgba(129, 140, 248, 0.08);
-        border-color: rgba(129, 140, 248, 0.24);
+      [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans {
+        border-left: 2px solid rgba(99, 102, 241, 0.48);
+        background: rgba(99, 102, 241, 0.045);
+        border-radius: 0 6px 6px 0;
+        padding: 4px 10px;
+        margin: -3px 0 4px 0;
       }
-      .ag-tt-card-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        margin-bottom: 6px;
-        font-size: 11px;
-        opacity: 0.85;
+      html.dark [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans,
+      body.dark [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans {
+        background: rgba(129, 140, 248, 0.075);
+        border-left-color: rgba(129, 140, 248, 0.55);
       }
-      .ag-tt-card-meta {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-weight: 600;
-        color: #6366f1;
-      }
-      html.dark .ag-tt-card-meta,
-      body.dark .ag-tt-card-meta {
-        color: #a5b4fc;
-      }
-      .ag-tt-card-actions {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-      }
-      .ag-tt-card-btn {
-        border: 1px solid rgba(128, 128, 128, 0.28);
+      [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] .ag-tt-para-trans {
+        border-left: none;
         background: transparent;
-        color: inherit;
-        border-radius: 5px;
-        padding: 1px 6px;
-        font-size: 10.5px;
-        cursor: pointer;
-        opacity: 0.85;
+        padding: 0;
+        margin: 0;
       }
-      .ag-tt-card-btn:hover {
-        opacity: 1;
-        border-color: #6366f1;
+      .ag-tt-para-trans p {
+        margin: 0 0 4px 0;
       }
-      .ag-tt-card-body p {
-        margin: 0 0 6px 0;
-      }
-      .ag-tt-card-body p:last-child {
+      .ag-tt-para-trans p:last-child {
         margin-bottom: 0;
       }
-      .ag-tt-card-body .ag-tt-heading {
-        margin: 6px 0 4px 0;
+      .ag-tt-para-trans .ag-tt-heading {
+        margin: 4px 0 3px 0;
         font-weight: 600;
-        font-size: 13px;
+        font-size: 13.5px;
       }
-      .ag-tt-card-body .ag-tt-list {
-        margin: 4px 0 6px 0;
+      .ag-tt-para-trans .ag-tt-list {
+        margin: 2px 0 4px 0;
         padding-left: 18px;
       }
-      .ag-tt-card-body .ag-tt-list li {
+      .ag-tt-para-trans .ag-tt-list li {
         margin-bottom: 2px;
       }
-      .ag-tt-card-body .ag-tt-inline-code {
+      .ag-tt-para-trans .ag-tt-inline-code {
         padding: 1px 4px;
         border-radius: 4px;
         background: rgba(128, 128, 128, 0.16);
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         font-size: 0.9em;
       }
-      .ag-tt-card-body .ag-tt-code-block {
-        margin: 6px 0;
-        padding: 8px 10px;
+      .ag-tt-para-trans .ag-tt-code-block {
+        margin: 4px 0;
+        padding: 6px 8px;
         border-radius: 6px;
         background: rgba(0, 0, 0, 0.12);
         overflow-x: auto;
@@ -317,7 +344,29 @@
         font-size: 12px;
         line-height: 1.45;
       }
+      .ag-tt-token-in {
+        animation: agTtTokenFade 0.2s ease-out both;
+      }
+      .ag-tt-stream-caret {
+        display: inline-block;
+        width: 5px;
+        height: 0.9em;
+        margin-left: 3px;
+        vertical-align: -0.1em;
+        border-radius: 1px;
+        background: #6366f1;
+        animation: agTtCaretBlink 0.9s infinite;
+      }
+      .ag-tt-shimmer-wait {
+        font-size: 12px;
+        opacity: 0.68;
+      }
+      .ag-tt-para-error {
+        font-size: 12px;
+        color: #ef4444;
+      }
     `;
+    document.head.appendChild(styleEl);
   }
 
   // =========================================================================
@@ -400,25 +449,56 @@
   }
 
   // =========================================================================
-  // UI Rendering & Settings Sync
+  // UI Rendering & Cascading Model Settings Sync
   // =========================================================================
+  function getEffectiveModelsList() {
+    const list = models.slice();
+    if (settings.model && !list.some(m => m.id === settings.model)) {
+      list.unshift({ id: settings.model, label: settings.model });
+    }
+    return list;
+  }
+
   function getModelLabel(modelId) {
-    const found = models.find(m => m.id === modelId);
+    const found = getEffectiveModelsList().find(m => m.id === modelId);
     return found ? found.label : modelId;
+  }
+
+  function renderModelCascadeSelects() {
+    const baseSelect = el('tt-model-base');
+    const levelSelect = el('tt-model-level');
+    if (!baseSelect || !levelSelect) return;
+
+    const groups = groupModelsForCascade(getEffectiveModelsList());
+    const sel = resolveCascadeSelection(groups, settings.model || DEFAULT_MODEL);
+    if (sel.levelKey) {
+      preferredLevelKey = sel.levelKey;
+    }
+
+    baseSelect.innerHTML = '';
+    for (const g of groups) {
+      const opt = document.createElement('option');
+      opt.value = g.baseKey;
+      opt.textContent = g.baseLabel;
+      baseSelect.appendChild(opt);
+    }
+    baseSelect.value = sel.baseKey;
+
+    levelSelect.innerHTML = '';
+    for (const o of sel.group.options) {
+      const opt = document.createElement('option');
+      opt.value = o.id;
+      opt.textContent = o.levelDisplay;
+      levelSelect.appendChild(opt);
+    }
+    levelSelect.value = sel.modelId;
+    levelSelect.disabled = sel.group.options.length <= 1;
   }
 
   function renderSettingsUI() {
     if (el('tt-version')) el('tt-version').textContent = `v${PLUGIN_VERSION}`;
     const enabledInput = el('tt-enabled');
     if (enabledInput) enabledInput.checked = Boolean(settings.enabled);
-
-    const autoExpandInput = el('tt-auto-expand');
-    if (autoExpandInput) autoExpandInput.checked = Boolean(settings.autoExpandHeight);
-    if (settings.autoExpandHeight) {
-      document.documentElement.setAttribute('data-ag-tt-expand', '1');
-    } else {
-      document.documentElement.removeAttribute('data-ag-tt-expand');
-    }
 
     const langSelect = el('tt-target-lang');
     if (langSelect) {
@@ -447,21 +527,7 @@
     if (modeBi) modeBi.setAttribute('data-active', settings.displayMode === 'bilingual' ? 'true' : 'false');
     if (modeTr) modeTr.setAttribute('data-active', settings.displayMode === 'translation_only' ? 'true' : 'false');
 
-    const modelSelect = el('tt-model');
-    if (modelSelect) {
-      const list = models.slice();
-      if (settings.model && !list.some(m => m.id === settings.model)) {
-        list.unshift({ id: settings.model, label: settings.model });
-      }
-      modelSelect.innerHTML = '';
-      for (const m of list) {
-        const opt = document.createElement('option');
-        opt.value = m.id;
-        opt.textContent = m.label;
-        modelSelect.appendChild(opt);
-      }
-      modelSelect.value = settings.model || DEFAULT_MODEL;
-    }
+    renderModelCascadeSelects();
 
     const cap = el('tt-capsule');
     const capLabel = el('tt-capsule-label');
@@ -495,6 +561,38 @@
     }
   }
 
+  function resetAllTranslationStates(clearMem = false) {
+    if (clearMem) {
+      memCache.clear();
+      checkedCanonMisses.clear();
+    }
+    highQueue.length = 0;
+    bgQueue.length = 0;
+
+    for (const wrapper of Array.from(trackedWrappers)) {
+      if (!wrapper.isConnected) {
+        trackedWrappers.delete(wrapper);
+        continue;
+      }
+      const st = blockStates.get(wrapper);
+      if (!st) continue;
+      st.fiberBlocks = [];
+      for (const p of st.domParas.values()) {
+        p.status = 'idle';
+        p.targetText = '';
+        p.revealedLen = 0;
+        p.lastHtmlLen = -1;
+        p.fromCache = false;
+        p.error = '';
+        p.canonKey = '';
+        if (p.origEl?.isConnected) p.origEl.removeAttribute('data-ag-tt-orig-ready');
+        if (p.transEl?.isConnected) p.transEl.remove();
+      }
+      st.domParas.clear();
+      syncWrapperHeaderUI(wrapper, st);
+    }
+  }
+
   async function persistSettings(partial) {
     const prevLang = getEffectiveTargetLang(settings);
     const prevModel = settings.model;
@@ -513,51 +611,35 @@
     const nextLang = getEffectiveTargetLang(settings);
     const configChanged = prevLang !== nextLang || prevModel !== settings.model;
 
-    // Immediately re-render all tracked blocks for displayMode changes or re-translate if lang/model changed
-    for (const wrapper of Array.from(trackedWrappers)) {
-      if (!wrapper.isConnected) {
-        trackedWrappers.delete(wrapper);
-        continue;
+    if (configChanged) {
+      resetAllTranslationStates(true);
+    } else {
+      for (const wrapper of Array.from(trackedWrappers)) {
+        if (!wrapper.isConnected) {
+          trackedWrappers.delete(wrapper);
+          continue;
+        }
+        const st = blockStates.get(wrapper);
+        if (st) syncWrapperModeAndOrigVisibility(wrapper, st);
       }
-      const st = blockStates.get(wrapper);
-      if (!st) continue;
-      if (configChanged) {
-        st.status = 'idle';
-        st.translation = '';
-        st.cacheKey = '';
-        st.error = '';
-      }
-      syncBlockDOM(wrapper, st);
-      if (settings.enabled && configChanged && st.lastOrigText && shouldTranslateText(st.lastOrigText, nextLang)) {
-        const group = getGroupContainer(wrapper);
-        if (group || st.wasStreaming) {
-          void translateBlock(wrapper, false);
+    }
+
+    renderSettingsUI();
+    scheduleScan();
+  }
+
+  // =========================================================================
+  // React Fiber Inspection & DOM Helpers
+  // =========================================================================
+  function getReactFiber(domEl) {
+    if (!domEl || typeof domEl !== 'object') return null;
+    try {
+      for (const key of Object.keys(domEl)) {
+        if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) {
+          return domEl[key];
         }
       }
-    }
-    renderSettingsUI();
-  }
-
-  // =========================================================================
-  // Thinking Block Discovery, Observation & React-Safe Rendering
-  // =========================================================================
-  function getGroupContainer(wrapper) {
-    if (!wrapper) return null;
-    for (const child of wrapper.children) {
-      if (child.getAttribute && child.getAttribute('role') === 'group') {
-        return child;
-      }
-    }
-    return null;
-  }
-
-  function getOrigContentDiv(group) {
-    if (!group) return null;
-    for (const child of group.children) {
-      if (child.tagName === 'DIV' && !child.hasAttribute('data-ag-tt-card')) {
-        return child;
-      }
-    }
+    } catch {}
     return null;
   }
 
@@ -566,36 +648,524 @@
     return Boolean(trigger.querySelector('.animate-shimmer-text')) || /^Thinking\b/i.test((trigger.textContent || '').trim());
   }
 
+  function extractThinkingFromFiber(trigger) {
+    let cur = getReactFiber(trigger);
+    for (let i = 0; i < 15 && cur; i++) {
+      const props = cur.memoizedProps;
+      if (props && typeof props.thinking === 'string' && props.thinking.trim()) {
+        return props.thinking;
+      }
+      cur = cur.return;
+    }
+    return '';
+  }
+
+  function extractToolGroupThinkingsFromFiber(buttonEl) {
+    let cur = getReactFiber(buttonEl);
+    for (let i = 0; i < 12 && cur; i++) {
+      const props = cur.memoizedProps;
+      if (props && Array.isArray(props.steps)) {
+        const list = [];
+        for (const s of props.steps) {
+          const val = s?.step?.value;
+          const th = val?.rawThinking || val?.thinking;
+          if (typeof th === 'string' && th.trim()) {
+            list.push(th);
+          }
+        }
+        return list;
+      }
+      cur = cur.return;
+    }
+    return [];
+  }
+
+  function extractBlockSourceText(blockEl) {
+    if (!blockEl) return '';
+    let cur = getReactFiber(blockEl);
+    for (let i = 0; i < 4 && cur; i++) {
+      const props = cur.memoizedProps;
+      if (props && typeof props.text === 'string' && Array.isArray(props.remarkPlugins) && props.text.trim()) {
+        return normalizeThinkingText(props.text);
+      }
+      cur = cur.return;
+    }
+    if (blockEl.tagName === 'UL' || blockEl.tagName === 'OL') {
+      const items = [];
+      for (const li of blockEl.children) {
+        if (li.tagName === 'LI') {
+          const t = (li.innerText || li.textContent || '').trim();
+          if (t) items.push(blockEl.tagName === 'OL' ? `1. ${t}` : `- ${t}`);
+        }
+      }
+      if (items.length) return normalizeThinkingText(items.join('\n'));
+    }
+    return normalizeThinkingText(blockEl.innerText || blockEl.textContent || '');
+  }
+
+  function getViewportContainer(wrapper, trigger) {
+    if (!wrapper) return null;
+    for (const child of wrapper.children) {
+      if (child !== trigger && !child.hasAttribute('data-ag-tt-ui') && child.tagName === 'DIV') {
+        if (child.classList.contains('overflow-y-auto') || child.querySelector('[data-markdown-root]')) {
+          return child;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findMarkdownRoot(viewport) {
+    if (!viewport) return null;
+    const explicit = viewport.querySelector('[data-markdown-root]');
+    if (explicit) return explicit;
+    const fallback = viewport.querySelector('.cursor-edit > div') || viewport.querySelector('.cursor-edit');
+    if (fallback && !fallback.classList.contains('ag-tt-fallback-root')) {
+      fallback.classList.add('ag-tt-fallback-root');
+    }
+    return fallback || null;
+  }
+
+  function collectTranslatableDomBlocks(markdownRoot) {
+    if (!markdownRoot) return [];
+    const blocks = [];
+    for (const child of markdownRoot.children) {
+      if (child.nodeType !== 1) continue;
+      if (child.hasAttribute('data-ag-tt-para')) continue;
+      if (!TRANSLATABLE_TAGS.has(child.tagName)) continue;
+      const txt = extractBlockSourceText(child);
+      if (txt) {
+        blocks.push({ origEl: child, text: txt });
+      }
+    }
+    return blocks;
+  }
+
   function getOrInitBlockState(wrapper) {
     let st = blockStates.get(wrapper);
     if (!st) {
       st = {
-        lastOrigText: '',
-        lastGrowthAt: 0,
+        seenOnInitialScan: false,
         wasStreaming: false,
-        status: 'idle',
-        translation: '',
-        partialText: '',
-        cacheKey: '',
-        error: '',
-        localViewMode: null
+        autoTranslateOnExpand: false,
+        forceTranslateOnExpand: false,
+        localViewMode: null,
+        domParas: new Map(), // origEl -> ParaState
+        orderedOrigEls: [],
+        fiberBlocks: [] // [{ text, canonKey, lastGrowthAt, status, targetText, fromCache, error }]
       };
       blockStates.set(wrapper, st);
     }
     trackedWrappers.add(wrapper);
+    wrapper.setAttribute('data-ag-tt-wrapper', '1');
     return st;
   }
 
-  function ensureTriggerBadge(wrapper, st) {
-    let badge = null;
+  // =========================================================================
+  // Priority Concurrent Translation Scheduler (Foreground <=4, Background <=2)
+  // =========================================================================
+  function dispatchSchedulerQueue() {
+    if (disposed) return;
+
+    while (activeHighCount + activeBgCount < MAX_ACTIVE_REQUESTS) {
+      let picked = null;
+      let lane = null;
+
+      if (highQueue.length > 0) {
+        picked = highQueue.shift();
+        lane = 'high';
+      } else if (bgQueue.length > 0 && activeBgCount < MAX_BG_REQUESTS) {
+        picked = bgQueue.shift();
+        lane = 'bg';
+      } else {
+        break;
+      }
+
+      if (!picked || picked.done || picked.cancelled) continue;
+      runScheduledTask(picked, lane);
+    }
+  }
+
+  function runScheduledTask(task, lane) {
+    task.lane = lane;
+    task.running = true;
+    if (lane === 'high') activeHighCount++;
+    else activeBgCount++;
+    activeTranslations = activeHighCount + activeBgCount;
+    renderSettingsUI();
+
+    for (const sub of task.subscribers) {
+      sub.onStart?.();
+    }
+
+    void callTranslate(
+      { text: task.text, targetLang: task.targetLang, model: task.model, force: task.force },
+      prog => {
+        if (disposed || !prog || typeof prog.text !== 'string') return;
+        task.lastPartial = prog.text;
+        for (const sub of task.subscribers) {
+          sub.onProgress?.(prog.text);
+        }
+      }
+    ).then(res => {
+      if (disposed) return;
+      if (res && res.ok && typeof res.translation === 'string') {
+        if (!res.cached) cacheCount++;
+        memCache.set(task.canonKey, res.translation);
+        checkedCanonMisses.delete(task.canonKey);
+        for (const sub of task.subscribers) {
+          sub.onDone?.(res.translation, Boolean(res.cached));
+        }
+      } else {
+        const errMsg = res?.error || '翻译失败';
+        lastErrorMsg = errMsg;
+        for (const sub of task.subscribers) {
+          sub.onError?.(errMsg);
+        }
+      }
+    }).catch(err => {
+      if (disposed) return;
+      const errMsg = err?.message || String(err);
+      lastErrorMsg = errMsg;
+      for (const sub of task.subscribers) {
+        sub.onError?.(errMsg);
+      }
+    }).finally(() => {
+      task.done = true;
+      task.running = false;
+      activeTasks.delete(task.taskKey);
+      if (task.lane === 'high') activeHighCount = Math.max(0, activeHighCount - 1);
+      else activeBgCount = Math.max(0, activeBgCount - 1);
+      activeTranslations = activeHighCount + activeBgCount;
+      renderSettingsUI();
+      setTimeout(dispatchSchedulerQueue, SCHEDULER_DEQUEUE_SCAN_MS);
+    });
+  }
+
+  function scheduleParagraphTranslation({ text, targetLang, model, force = false, priority = 'high', subscriber }) {
+    const canonKey = computeCanonicalCacheKey(text, targetLang, model);
+    if (!force && memCache.has(canonKey)) {
+      const hit = memCache.get(canonKey);
+      subscriber.onDone?.(hit, true);
+      return;
+    }
+
+    const taskKey = force ? `force:${canonKey}:${++reqSeq}` : canonKey;
+    let task = activeTasks.get(canonKey);
+
+    if (force || !task) {
+      task = {
+        taskKey,
+        canonKey,
+        text,
+        targetLang,
+        model,
+        force,
+        priority,
+        running: false,
+        done: false,
+        cancelled: false,
+        lastPartial: '',
+        subscribers: new Set([subscriber])
+      };
+      activeTasks.set(taskKey, task);
+      if (priority === 'high') highQueue.push(task);
+      else bgQueue.push(task);
+      dispatchSchedulerQueue();
+      return;
+    }
+
+    // Attach to existing inflight/queued task and upgrade priority if requested
+    task.subscribers.add(subscriber);
+    if (task.running) {
+      subscriber.onStart?.();
+      if (task.lastPartial) subscriber.onProgress?.(task.lastPartial);
+    } else if (priority === 'high' && task.priority === 'bg') {
+      task.priority = 'high';
+      const idx = bgQueue.indexOf(task);
+      if (idx !== -1) bgQueue.splice(idx, 1);
+      if (!highQueue.includes(task)) highQueue.push(task);
+      dispatchSchedulerQueue();
+    }
+  }
+
+  async function prewarmBackendCache(items, targetLang, model) {
+    const unqueried = [];
+    const seenKeys = new Set();
+    for (const item of items) {
+      const ck = computeCanonicalCacheKey(item.text, targetLang, model);
+      if (memCache.has(ck) || checkedCanonMisses.has(ck) || seenKeys.has(ck)) continue;
+      seenKeys.add(ck);
+      unqueried.push({ id: ck, text: item.text });
+    }
+    if (!unqueried.length) return;
+
+    try {
+      const res = await callBridge('/check-cache', { items: unqueried, targetLang, model });
+      if (res && res.ok && res.hits) {
+        for (const q of unqueried) {
+          if (typeof res.hits[q.id] === 'string') {
+            memCache.set(q.id, res.hits[q.id]);
+          } else {
+            checkedCanonMisses.add(q.id);
+          }
+        }
+        if (res.cacheStats && typeof res.cacheStats.count === 'number') {
+          cacheCount = res.cacheStats.count;
+        }
+        renderSettingsUI();
+        scheduleScan();
+      }
+    } catch {}
+  }
+
+  // =========================================================================
+  // Smooth RequestAnimationFrame Streaming Renderer & Per-Paragraph DOM Sync
+  // =========================================================================
+  function clampCodePointBoundary(text, nextLen) {
+    if (nextLen <= 0 || nextLen >= text.length) return nextLen;
+    const code = text.charCodeAt(nextLen - 1);
+    if (code >= 0xd800 && code <= 0xdbff && nextLen < text.length) {
+      return nextLen + 1;
+    }
+    return nextLen;
+  }
+
+  function renderParaTransEl(p) {
+    if (!p.transEl || !p.transEl.isConnected) return;
+
+    if (p.status === 'error') {
+      if (p.lastRenderState !== `err:${p.error}`) {
+        p.lastRenderState = `err:${p.error}`;
+        p.transEl.innerHTML = `<div class="ag-tt-para-error">${escapeHtml(p.error || '翻译失败')}</div>`;
+      }
+      if (p.origEl?.isConnected) p.origEl.removeAttribute('data-ag-tt-orig-ready');
+      return;
+    }
+
+    if (p.status === 'idle' || p.status === 'skipped') {
+      if (p.lastRenderState !== 'empty') {
+        p.lastRenderState = 'empty';
+        p.transEl.innerHTML = '';
+      }
+      if (p.origEl?.isConnected) p.origEl.removeAttribute('data-ag-tt-orig-ready');
+      return;
+    }
+
+    const totalLen = p.targetText ? p.targetText.length : 0;
+    if (p.fromCache || (p.status === 'done' && p.revealedLen >= totalLen)) {
+      p.revealedLen = totalLen;
+    }
+
+    if (p.revealedLen === 0) {
+      if (p.status === 'translating' || p.status === 'queued') {
+        if (p.lastRenderState !== 'waiting') {
+          p.lastRenderState = 'waiting';
+          p.transEl.innerHTML = '<span class="ag-tt-shimmer-wait">正在翻译...</span>';
+        }
+      }
+      // Keep original visible until first characters appear to avoid height collapse!
+      if (p.origEl?.isConnected) p.origEl.removeAttribute('data-ag-tt-orig-ready');
+      return;
+    }
+
+    const slice = p.targetText.slice(0, p.revealedLen);
+    const isActivelyStreaming = p.status === 'translating' || (p.status === 'done' && p.revealedLen < totalLen);
+    const renderKey = `${isActivelyStreaming ? 's' : 'd'}:${p.revealedLen}:${totalLen}:${p.canonKey}`;
+
+    if (p.lastRenderState !== renderKey) {
+      const prevLen = Math.max(0, p.lastHtmlLen);
+      p.lastHtmlLen = p.revealedLen;
+      p.lastRenderState = renderKey;
+      p.transEl.innerHTML = renderStreamingMarkdownHtml(slice, prevLen, isActivelyStreaming);
+    }
+
+    if (p.origEl?.isConnected) {
+      p.origEl.setAttribute('data-ag-tt-orig-ready', '1');
+    }
+  }
+
+  function hasPendingAnimations() {
+    for (const wrapper of trackedWrappers) {
+      if (!wrapper.isConnected) continue;
+      const st = blockStates.get(wrapper);
+      if (!st) continue;
+      for (const p of st.domParas.values()) {
+        if (!p.fromCache && p.targetText && p.revealedLen < p.targetText.length) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function ensureAnimationLoop() {
+    if (disposed || rafId) return;
+    if (!hasPendingAnimations()) return;
+
+    const tick = now => {
+      rafId = 0;
+      if (disposed) return;
+
+      let stillPending = false;
+      const shouldStep = now - lastAnimTick >= STREAM_FRAME_INTERVAL_MS;
+      if (shouldStep) lastAnimTick = now;
+
+      for (const wrapper of Array.from(trackedWrappers)) {
+        if (!wrapper.isConnected) {
+          trackedWrappers.delete(wrapper);
+          continue;
+        }
+        const st = blockStates.get(wrapper);
+        if (!st) continue;
+
+        for (const p of st.domParas.values()) {
+          if (p.fromCache || !p.targetText) continue;
+          const targetLen = p.targetText.length;
+          if (p.revealedLen < targetLen) {
+            stillPending = true;
+            if (shouldStep) {
+              const remaining = targetLen - p.revealedLen;
+              const step = Math.max(2, Math.ceil(remaining * 0.25));
+              p.revealedLen = clampCodePointBoundary(p.targetText, Math.min(targetLen, p.revealedLen + step));
+              renderParaTransEl(p);
+            }
+          } else if (p.status === 'done' && p.lastRenderState?.startsWith('s:')) {
+            renderParaTransEl(p);
+          }
+        }
+      }
+
+      if (stillPending && !disposed) {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+
+    rafId = requestAnimationFrame(tick);
+  }
+
+  // =========================================================================
+  // Wrapper Trigger UI & Display Mode Synchronization
+  // =========================================================================
+  function getEffectiveWrapperMode(st) {
+    return st.localViewMode || settings.displayMode;
+  }
+
+  function computeWrapperProgress(st) {
+    let total = 0;
+    let done = 0;
+    let translating = 0;
+    let errorCount = 0;
+    let hasTranslatedContent = false;
+
+    if (st.orderedOrigEls.length > 0) {
+      for (const origEl of st.orderedOrigEls) {
+        const p = st.domParas.get(origEl);
+        if (!p || p.status === 'skipped') continue;
+        total++;
+        if (p.status === 'done') {
+          done++;
+          if (p.targetText) hasTranslatedContent = true;
+        } else if (p.status === 'translating' || p.status === 'queued') {
+          translating++;
+          if (p.targetText) hasTranslatedContent = true;
+        } else if (p.status === 'error') {
+          errorCount++;
+        }
+      }
+    } else if (st.fiberBlocks.length > 0) {
+      for (const fb of st.fiberBlocks) {
+        if (fb.status === 'skipped') continue;
+        total++;
+        if (fb.status === 'done') {
+          done++;
+          if (fb.targetText) hasTranslatedContent = true;
+        } else if (fb.status === 'translating' || fb.status === 'queued') {
+          translating++;
+        } else if (fb.status === 'error') {
+          errorCount++;
+        }
+      }
+    }
+
+    let overallStatus = 'idle';
+    if (translating > 0) overallStatus = 'translating';
+    else if (errorCount > 0 && done === 0) overallStatus = 'error';
+    else if (total > 0 && done === total) overallStatus = 'done';
+    else if (done > 0) overallStatus = 'partial';
+
+    return { total, done, translating, errorCount, overallStatus, hasTranslatedContent };
+  }
+
+  function syncWrapperModeAndOrigVisibility(wrapper, st) {
+    const mode = getEffectiveWrapperMode(st);
+    wrapper.setAttribute('data-ag-tt-mode', mode);
+    const prog = computeWrapperProgress(st);
+    if (prog.hasTranslatedContent || prog.translating > 0) {
+      wrapper.setAttribute('data-ag-tt-active', '1');
+    } else {
+      wrapper.removeAttribute('data-ag-tt-active');
+    }
+    syncWrapperHeaderUI(wrapper, st, prog);
+  }
+
+  function syncWrapperHeaderUI(wrapper, st, precomputedProg) {
+    if (!wrapper || !wrapper.isConnected) return;
+    let bar = null;
     for (const child of wrapper.children) {
-      if (child.classList && child.classList.contains('ag-tt-trigger-badge')) {
-        badge = child;
+      if (child.classList && child.classList.contains('ag-tt-trigger-bar')) {
+        bar = child;
         break;
       }
     }
-    if (!badge) {
-      badge = document.createElement('span');
+
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'ag-tt-trigger-bar';
+      bar.setAttribute('data-ag-tt-ui', '1');
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.type = 'button';
+      toggleBtn.className = 'ag-tt-mini-btn';
+      toggleBtn.setAttribute('data-act', 'toggle-orig');
+      toggleBtn.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const cur = getEffectiveWrapperMode(st);
+        st.localViewMode = cur === 'translation_only' ? 'bilingual' : 'translation_only';
+        syncWrapperModeAndOrigVisibility(wrapper, st);
+      });
+
+      const retranslateBtn = document.createElement('button');
+      retranslateBtn.type = 'button';
+      retranslateBtn.className = 'ag-tt-mini-btn';
+      retranslateBtn.setAttribute('data-act', 'retranslate');
+      retranslateBtn.textContent = '重译';
+      retranslateBtn.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        void translateWrapperNow(wrapper, true);
+      });
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'ag-tt-mini-btn';
+      copyBtn.setAttribute('data-act', 'copy');
+      copyBtn.textContent = '复制';
+      copyBtn.addEventListener('click', async ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const btn = ev.currentTarget;
+        const text = collectWrapperTranslationText(st);
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = '已复制';
+          setTimeout(() => { if (btn.isConnected) btn.textContent = '复制'; }, 1200);
+        } catch {}
+      });
+
+      const badge = document.createElement('span');
       badge.className = 'ag-tt-trigger-badge';
       badge.setAttribute('role', 'button');
       badge.tabIndex = -1;
@@ -603,252 +1173,443 @@
         ev.preventDefault();
         ev.stopPropagation();
         const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
-        const group = getGroupContainer(wrapper);
-        if (!group && trigger) {
-          // Expand first so we can read text, then translate
+        const viewport = getViewportContainer(wrapper, trigger);
+        const progNow = computeWrapperProgress(st);
+        if (!viewport && trigger) {
           st.autoTranslateOnExpand = true;
+          st.forceTranslateOnExpand = progNow.overallStatus === 'done';
           trigger.click();
           return;
         }
-        void translateBlock(wrapper, st.status === 'done');
+        void translateWrapperNow(wrapper, progNow.overallStatus === 'done');
       });
-      wrapper.appendChild(badge);
+
+      bar.appendChild(toggleBtn);
+      bar.appendChild(retranslateBtn);
+      bar.appendChild(copyBtn);
+      bar.appendChild(badge);
+      wrapper.appendChild(bar);
     }
 
-    badge.setAttribute('data-status', st.status);
-    if (st.status === 'translating') {
-      badge.textContent = '译中...';
-      badge.title = '正在翻译思考过程';
-    } else if (st.status === 'done') {
-      badge.textContent = `已译 · ${getEffectiveTargetLang(settings)}`;
-      badge.title = '点击重新翻译';
-    } else if (st.status === 'error') {
-      badge.textContent = '译失败';
-      badge.title = st.error || '点击重试';
-    } else if (st.status === 'skipped') {
-      badge.style.display = 'none';
-      return;
-    } else {
-      badge.textContent = '译';
-      badge.title = '点击翻译该段思考';
-    }
-    badge.style.display = settings.enabled || st.status === 'done' || st.status === 'translating' ? 'inline-flex' : 'none';
-  }
-
-  function ensureTranslationCard(wrapper, group, st) {
-    if (!group) return;
-    let card = null;
-    for (const child of group.children) {
-      if (child.hasAttribute && child.hasAttribute('data-ag-tt-card')) {
-        card = child;
-        break;
-      }
-    }
-
-    const shouldShowCard = st.status === 'translating' || st.status === 'done' || st.status === 'error';
-    if (!shouldShowCard) {
-      if (card) card.remove();
-      group.removeAttribute('data-ag-tt-has-card');
-      group.removeAttribute('data-ag-tt-hide-orig');
-      return;
-    }
-
-    if (!card) {
-      card = document.createElement('div');
-      card.setAttribute('data-ag-tt-card', '1');
-      card.className = 'ag-tt-card';
-      card.innerHTML = `
-        <div class="ag-tt-card-header">
-          <span class="ag-tt-card-meta"></span>
-          <span class="ag-tt-card-actions">
-            <button type="button" class="ag-tt-card-btn" data-act="toggle-orig"></button>
-            <button type="button" class="ag-tt-card-btn" data-act="retranslate">重译</button>
-            <button type="button" class="ag-tt-card-btn" data-act="copy">复制</button>
-          </span>
-        </div>
-        <div class="ag-tt-card-body"></div>
-      `;
-
-      card.querySelector('[data-act="toggle-orig"]').addEventListener('click', ev => {
-        ev.stopPropagation();
-        const curEffective = st.localViewMode || settings.displayMode;
-        st.localViewMode = curEffective === 'translation_only' ? 'bilingual' : 'translation_only';
-        syncBlockDOM(wrapper, st);
-      });
-      card.querySelector('[data-act="retranslate"]').addEventListener('click', ev => {
-        ev.stopPropagation();
-        void translateBlock(wrapper, true);
-      });
-      card.querySelector('[data-act="copy"]').addEventListener('click', async ev => {
-        ev.stopPropagation();
-        const btn = ev.currentTarget;
-        const txt = st.translation || st.partialText || '';
-        if (!txt) return;
-        try {
-          await navigator.clipboard.writeText(txt);
-          btn.textContent = '已复制';
-          setTimeout(() => { if (btn.isConnected) btn.textContent = '复制'; }, 1200);
-        } catch {}
-      });
-      group.appendChild(card);
-    }
-
-    const effMode = st.localViewMode || settings.displayMode;
-    const displayText = st.status === 'done' ? st.translation : (st.partialText || '');
-    const canHideOrig = effMode === 'translation_only' && Boolean(displayText.trim());
-
-    group.setAttribute('data-ag-tt-has-card', '1');
-    if (canHideOrig) {
-      group.setAttribute('data-ag-tt-hide-orig', '1');
-    } else {
-      group.removeAttribute('data-ag-tt-hide-orig');
-    }
-
-    const metaEl = card.querySelector('.ag-tt-card-meta');
-    const toggleBtn = card.querySelector('[data-act="toggle-orig"]');
-    const bodyEl = card.querySelector('.ag-tt-card-body');
+    const prog = precomputedProg || computeWrapperProgress(st);
+    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+    const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
+    const showTools = isExpanded && (prog.translating > 0 || prog.done > 0);
+    const effMode = getEffectiveWrapperMode(st);
     const effLang = getEffectiveTargetLang(settings);
-    const modelLabel = getModelLabel(settings.model);
 
-    if (metaEl) {
-      if (st.status === 'translating') {
-        metaEl.textContent = `正在翻译 (${effLang}) · ${modelLabel}...`;
-      } else if (st.status === 'error') {
-        metaEl.textContent = `翻译失败 (${modelLabel})`;
-      } else {
-        metaEl.textContent = `译文 (${effLang}) · ${modelLabel}`;
-      }
-    }
+    const toggleBtn = bar.querySelector('[data-act="toggle-orig"]');
+    const retranslateBtn = bar.querySelector('[data-act="retranslate"]');
+    const copyBtn = bar.querySelector('[data-act="copy"]');
+    const badge = bar.querySelector('.ag-tt-trigger-badge');
 
     if (toggleBtn) {
-      toggleBtn.textContent = canHideOrig ? '显示原文' : '只看译文';
+      toggleBtn.style.display = showTools ? 'inline-flex' : 'none';
+      toggleBtn.textContent = effMode === 'translation_only' ? '显示原文' : '只看译文';
+    }
+    if (retranslateBtn) {
+      retranslateBtn.style.display = showTools ? 'inline-flex' : 'none';
+    }
+    if (copyBtn) {
+      copyBtn.style.display = showTools && prog.hasTranslatedContent ? 'inline-flex' : 'none';
     }
 
-    if (bodyEl) {
-      if (st.status === 'error') {
-        bodyEl.innerHTML = `<p style="color:#ef4444">${core.escapeHtml(st.error || '未知错误')}</p>`;
-      } else if (displayText) {
-        const html = renderSafeMarkdownHtml(displayText);
-        if (bodyEl.getAttribute('data-last-src') !== displayText) {
-          bodyEl.setAttribute('data-last-src', displayText);
-          bodyEl.innerHTML = html;
-        }
+    if (badge) {
+      badge.setAttribute('data-status', prog.overallStatus);
+      if (prog.overallStatus === 'translating') {
+        badge.textContent = prog.total > 1 ? `译中 ${prog.done}/${prog.total}` : '译中...';
+        badge.title = '正在流式翻译思考段落';
+      } else if (prog.overallStatus === 'done') {
+        badge.textContent = `已译 · ${effLang}`;
+        badge.title = '点击重新翻译';
+      } else if (prog.overallStatus === 'partial') {
+        badge.textContent = `已译 ${prog.done}/${prog.total}`;
+        badge.title = '点击继续翻译剩余段落';
+      } else if (prog.overallStatus === 'error') {
+        badge.textContent = '译失败';
+        badge.title = '点击重试翻译';
       } else {
-        bodyEl.innerHTML = `<p style="opacity:0.7">正在调用 ${core.escapeHtml(modelLabel)} 翻译...</p>`;
+        badge.textContent = '译';
+        badge.title = '点击翻译该段思考';
       }
     }
+
+    const visible = settings.enabled || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0;
+    bar.style.display = visible ? 'inline-flex' : 'none';
   }
 
-  function syncBlockDOM(wrapper, st) {
-    if (!wrapper || !wrapper.isConnected) return;
-    ensureTriggerBadge(wrapper, st);
-    const group = getGroupContainer(wrapper);
-    if (group) {
-      ensureTranslationCard(wrapper, group, st);
+  function collectWrapperTranslationText(st) {
+    const parts = [];
+    if (st.orderedOrigEls.length > 0) {
+      for (const origEl of st.orderedOrigEls) {
+        const p = st.domParas.get(origEl);
+        if (p && p.targetText) parts.push(p.targetText);
+      }
+    } else if (st.fiberBlocks.length > 0) {
+      for (const fb of st.fiberBlocks) {
+        if (fb.targetText) parts.push(fb.targetText);
+      }
     }
+    return parts.join('\n\n').trim();
   }
 
-  async function translateBlock(wrapper, force = false) {
+  // =========================================================================
+  // Per-Paragraph & Background Translation Orchestration
+  // =========================================================================
+  function startDomParaTranslation(wrapper, st, p, targetLang, model, force, priority) {
+    const activeCanon = p.canonKey;
+    p.status = 'queued';
+    if (force) {
+      p.targetText = '';
+      p.revealedLen = 0;
+      p.lastHtmlLen = -1;
+      p.fromCache = false;
+      p.error = '';
+    }
+    renderParaTransEl(p);
+    syncWrapperModeAndOrigVisibility(wrapper, st);
+
+    scheduleParagraphTranslation({
+      text: p.text,
+      targetLang,
+      model,
+      force,
+      priority,
+      subscriber: {
+        onStart: () => {
+          if (disposed || p.canonKey !== activeCanon || !p.transEl?.isConnected) return;
+          p.status = 'translating';
+          renderParaTransEl(p);
+          syncWrapperModeAndOrigVisibility(wrapper, st);
+        },
+        onProgress: partialText => {
+          if (disposed || p.canonKey !== activeCanon || !p.transEl?.isConnected) return;
+          p.status = 'translating';
+          p.fromCache = false;
+          p.targetText = partialText;
+          ensureAnimationLoop();
+        },
+        onDone: (finalText, cached) => {
+          if (disposed || p.canonKey !== activeCanon || !p.transEl?.isConnected) return;
+          p.status = 'done';
+          p.targetText = finalText;
+          p.error = '';
+          if (cached) {
+            p.fromCache = true;
+            p.revealedLen = finalText.length;
+            renderParaTransEl(p);
+          } else if (p.revealedLen >= finalText.length) {
+            renderParaTransEl(p);
+          } else {
+            p.fromCache = false;
+            ensureAnimationLoop();
+          }
+          syncWrapperModeAndOrigVisibility(wrapper, st);
+        },
+        onError: errMsg => {
+          if (disposed || p.canonKey !== activeCanon || !p.transEl?.isConnected) return;
+          p.status = 'error';
+          p.error = errMsg;
+          renderParaTransEl(p);
+          syncWrapperModeAndOrigVisibility(wrapper, st);
+        }
+      }
+    });
+  }
+
+  function startFiberBlockTranslation(fb, targetLang, model, priority, onStateChange) {
+    const activeCanon = fb.canonKey;
+    fb.status = 'queued';
+    onStateChange?.();
+
+    scheduleParagraphTranslation({
+      text: fb.text,
+      targetLang,
+      model,
+      force: false,
+      priority,
+      subscriber: {
+        onStart: () => {
+          if (disposed || fb.canonKey !== activeCanon) return;
+          fb.status = 'translating';
+          onStateChange?.();
+        },
+        onProgress: partialText => {
+          if (disposed || fb.canonKey !== activeCanon) return;
+          fb.status = 'translating';
+          fb.targetText = partialText;
+        },
+        onDone: (finalText, cached) => {
+          if (disposed || fb.canonKey !== activeCanon) return;
+          fb.status = 'done';
+          fb.targetText = finalText;
+          fb.fromCache = cached;
+          fb.error = '';
+          onStateChange?.();
+        },
+        onError: errMsg => {
+          if (disposed || fb.canonKey !== activeCanon) return;
+          fb.status = 'error';
+          fb.error = errMsg;
+          onStateChange?.();
+        }
+      }
+    });
+  }
+
+  function translateWrapperNow(wrapper, force = false) {
     if (disposed || !wrapper || !wrapper.isConnected) return;
     const st = getOrInitBlockState(wrapper);
-    const group = getGroupContainer(wrapper);
-    const origDiv = getOrigContentDiv(group);
-    if (origDiv) {
-      const liveText = normalizeThinkingText(origDiv.innerText || origDiv.textContent || '');
-      if (liveText) st.lastOrigText = liveText;
-    }
-
-    const sourceText = normalizeThinkingText(st.lastOrigText);
+    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+    const viewport = getViewportContainer(wrapper, trigger);
     const targetLang = getEffectiveTargetLang(settings);
     const model = settings.model || DEFAULT_MODEL;
 
-    if (!sourceText) return;
-    if (!force && !shouldTranslateText(sourceText, targetLang)) {
-      st.status = 'skipped';
-      syncBlockDOM(wrapper, st);
-      return;
-    }
-
-    const key = computeCacheKey(sourceText, targetLang, model);
-    if (!force && st.status === 'done' && st.cacheKey === key && st.translation) {
-      syncBlockDOM(wrapper, st);
-      return;
-    }
-
-    let waiters = activeTranslateKeys.get(key);
-    if (waiters) {
-      waiters.add(wrapper);
-      st.status = 'translating';
-      st.cacheKey = key;
-      syncBlockDOM(wrapper, st);
-      return;
-    }
-
-    waiters = new Set([wrapper]);
-    activeTranslateKeys.set(key, waiters);
-
-    st.status = 'translating';
-    st.error = '';
-    st.partialText = '';
-    st.cacheKey = key;
-    activeTranslations++;
-    lastErrorMsg = '';
-    syncBlockDOM(wrapper, st);
-    renderSettingsUI();
-
-    try {
-      const res = await callTranslate({ text: sourceText, targetLang, model, force }, prog => {
-        if (disposed || !prog || typeof prog.text !== 'string') return;
-        for (const w of waiters) {
-          if (!w.isConnected) continue;
-          const wst = blockStates.get(w);
-          if (!wst || wst.cacheKey !== key) continue;
-          wst.partialText = prog.text;
-          syncBlockDOM(w, wst);
+    if (viewport && st.orderedOrigEls.length > 0) {
+      for (const origEl of st.orderedOrigEls) {
+        const p = st.domParas.get(origEl);
+        if (!p) continue;
+        if (!shouldTranslateText(p.text, targetLang)) {
+          p.status = 'skipped';
+          continue;
         }
-      });
-
-      if (disposed) return;
-
-      if (res && res.ok && typeof res.translation === 'string') {
-        if (!res.cached) cacheCount++;
-        for (const w of waiters) {
-          if (!w.isConnected) continue;
-          const wst = blockStates.get(w);
-          if (!wst || wst.cacheKey !== key) continue;
-          wst.status = 'done';
-          wst.translation = res.translation;
-          wst.partialText = '';
-          wst.error = '';
-          syncBlockDOM(w, wst);
+        if (force || p.status === 'idle' || p.status === 'error') {
+          startDomParaTranslation(wrapper, st, p, targetLang, model, force, 'high');
         }
+      }
+      return;
+    }
+
+    if (st.fiberBlocks.length > 0) {
+      for (const fb of st.fiberBlocks) {
+        if (!shouldTranslateText(fb.text, targetLang)) {
+          fb.status = 'skipped';
+          continue;
+        }
+        if (force || fb.status === 'idle' || fb.status === 'error') {
+          startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
+            syncWrapperHeaderUI(wrapper, st);
+          });
+        }
+      }
+    }
+  }
+
+  function syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems) {
+    const domBlocks = collectTranslatableDomBlocks(markdownRoot);
+    const activeOrigSet = new Set(domBlocks.map(b => b.origEl));
+    const now = Date.now();
+
+    // Remove stale paragraph entries that React unmounted
+    for (const [origEl, p] of Array.from(st.domParas.entries())) {
+      if (!origEl.isConnected || !activeOrigSet.has(origEl)) {
+        if (p.transEl?.isConnected) p.transEl.remove();
+        st.domParas.delete(origEl);
+      }
+    }
+
+    st.orderedOrigEls = domBlocks.map(b => b.origEl);
+    const forceAll = st.autoTranslateOnExpand && st.forceTranslateOnExpand;
+    const wantExpandTranslate = st.autoTranslateOnExpand;
+    st.autoTranslateOnExpand = false;
+    st.forceTranslateOnExpand = false;
+
+    for (let i = 0; i < domBlocks.length; i++) {
+      const { origEl, text } = domBlocks[i];
+      const canonKey = computeCanonicalCacheKey(text, targetLang, model);
+      let p = st.domParas.get(origEl);
+
+      if (!p) {
+        const transEl = document.createElement('div');
+        transEl.className = 'ag-tt-para-trans';
+        transEl.setAttribute('data-ag-tt-para', '1');
+        p = {
+          wrapper,
+          origEl,
+          transEl,
+          text,
+          canonKey,
+          lastGrowthAt: now,
+          status: 'idle',
+          targetText: '',
+          revealedLen: 0,
+          lastHtmlLen: -1,
+          lastRenderState: '',
+          fromCache: false,
+          error: ''
+        };
+        st.domParas.set(origEl, p);
+      } else if (p.canonKey !== canonKey) {
+        p.text = text;
+        p.canonKey = canonKey;
+        p.lastGrowthAt = now;
+        p.status = 'idle';
+        p.targetText = '';
+        p.revealedLen = 0;
+        p.lastHtmlLen = -1;
+        p.lastRenderState = '';
+        p.fromCache = false;
+        p.error = '';
+      }
+
+      if (origEl.nextElementSibling !== p.transEl) {
+        markdownRoot.insertBefore(p.transEl, origEl.nextSibling);
+      }
+
+      if (!shouldTranslateText(text, targetLang)) {
+        p.status = 'skipped';
+        renderParaTransEl(p);
+        continue;
+      }
+
+      // Instant 0ms restore from client memory cache (populated by background pre-translation or /check-cache)
+      if (!forceAll && memCache.has(canonKey)) {
+        const hit = memCache.get(canonKey);
+        if (p.status !== 'done' || p.targetText !== hit) {
+          p.status = 'done';
+          p.targetText = hit;
+          p.fromCache = true;
+          p.revealedLen = hit.length;
+          p.error = '';
+          renderParaTransEl(p);
+        }
+        continue;
+      }
+
+      prewarmItems.push({ text });
+
+      const isTrailingBlock = i === domBlocks.length - 1;
+      const autoTrigger = settings.enabled && (!streamingNow || !isTrailingBlock || (now - p.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
+
+      if (forceAll || (wantExpandTranslate && p.status === 'idle') || (autoTrigger && p.status === 'idle')) {
+        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
       } else {
-        const errMsg = res?.error || '翻译失败';
-        lastErrorMsg = errMsg;
-        for (const w of waiters) {
-          if (!w.isConnected) continue;
-          const wst = blockStates.get(w);
-          if (!wst || wst.cacheKey !== key) continue;
-          wst.status = 'error';
-          wst.error = errMsg;
-          syncBlockDOM(w, wst);
+        renderParaTransEl(p);
+      }
+    }
+
+    syncWrapperModeAndOrigVisibility(wrapper, st);
+  }
+
+  function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems) {
+    const rawBlocks = splitMarkdownIntoBlocks(fiberThinking).filter(b => b.type === 'prose');
+    const now = Date.now();
+    const prevByCanon = new Map();
+    for (const prev of st.fiberBlocks) {
+      prevByCanon.set(prev.canonKey, prev);
+    }
+
+    const nextBlocks = [];
+    for (let i = 0; i < rawBlocks.length; i++) {
+      const text = rawBlocks[i].text;
+      const canonKey = computeCanonicalCacheKey(text, targetLang, model);
+      let fb = prevByCanon.get(canonKey);
+      if (!fb) {
+        fb = {
+          text,
+          canonKey,
+          lastGrowthAt: now,
+          status: 'idle',
+          targetText: '',
+          fromCache: false,
+          error: ''
+        };
+      }
+
+      if (!shouldTranslateText(text, targetLang)) {
+        fb.status = 'skipped';
+        nextBlocks.push(fb);
+        continue;
+      }
+
+      if (memCache.has(canonKey)) {
+        fb.status = 'done';
+        fb.targetText = memCache.get(canonKey);
+        fb.fromCache = true;
+        fb.error = '';
+        nextBlocks.push(fb);
+        continue;
+      }
+
+      prewarmItems.push({ text });
+
+      const isTrailing = i === rawBlocks.length - 1;
+      const canBgTranslate = settings.enabled && isRecentOrLive && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
+      if (canBgTranslate && fb.status === 'idle') {
+        startFiberBlockTranslation(fb, targetLang, model, 'bg', () => {
+          syncWrapperHeaderUI(wrapper, st);
+        });
+      }
+      nextBlocks.push(fb);
+    }
+
+    st.fiberBlocks = nextBlocks;
+    syncWrapperHeaderUI(wrapper, st);
+  }
+
+  function scanCollapsedToolGroups(targetLang, model, prewarmItems) {
+    const buttons = document.querySelectorAll('button[data-testid="tool-group-collapsible"]');
+    for (const btn of buttons) {
+      const isExpanded = btn.getAttribute('aria-expanded') === 'true';
+      if (isExpanded) continue;
+
+      const thinkings = extractToolGroupThinkingsFromFiber(btn);
+      if (!thinkings.length) {
+        if (!initialScanDone && !seenToolGroups.has(btn)) {
+          seenToolGroups.set(btn, '');
+        }
+        continue;
+      }
+
+      const combined = thinkings.join('\n\n---\n\n');
+      const hadSeenBefore = seenToolGroups.has(btn);
+      const prevFingerprint = seenToolGroups.get(btn) || '';
+
+      if (!initialScanDone) {
+        seenToolGroups.set(btn, combined);
+        historicalToolGroups.add(btn);
+        // On initial mount of existing history, only warm local cache without triggering fresh agy calls
+        for (const th of thinkings) {
+          for (const blk of splitMarkdownIntoBlocks(th)) {
+            if (blk.type === 'prose' && shouldTranslateText(blk.text, targetLang)) {
+              prewarmItems.push({ text: blk.text });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (historicalToolGroups.has(btn) && combined === prevFingerprint) {
+        continue;
+      }
+      historicalToolGroups.delete(btn);
+
+      if (!hadSeenBefore || combined !== prevFingerprint) {
+        seenToolGroups.set(btn, combined);
+      }
+
+      const stateList = toolGroupStates.get(btn) || [];
+      const prevMap = new Map(stateList.map(item => [item.canonKey, item]));
+      const nextList = [];
+
+      for (const th of thinkings) {
+        const blocks = splitMarkdownIntoBlocks(th).filter(b => b.type === 'prose');
+        for (const blk of blocks) {
+          const canonKey = computeCanonicalCacheKey(blk.text, targetLang, model);
+          if (!shouldTranslateText(blk.text, targetLang)) continue;
+          if (memCache.has(canonKey)) continue;
+          prewarmItems.push({ text: blk.text });
+          let entry = prevMap.get(canonKey);
+          if (!entry) {
+            entry = { text: blk.text, canonKey, status: 'idle', targetText: '', fromCache: false, error: '' };
+          }
+          if (settings.enabled && entry.status === 'idle') {
+            startFiberBlockTranslation(entry, targetLang, model, 'bg', null);
+          }
+          nextList.push(entry);
         }
       }
-    } catch (err) {
-      const errMsg = err?.message || String(err);
-      lastErrorMsg = errMsg;
-      for (const w of waiters) {
-        if (!w.isConnected) continue;
-        const wst = blockStates.get(w);
-        if (!wst || wst.cacheKey !== key) continue;
-        wst.status = 'error';
-        wst.error = errMsg;
-        syncBlockDOM(w, wst);
-      }
-    } finally {
-      activeTranslateKeys.delete(key);
-      activeTranslations = Math.max(0, activeTranslations - 1);
-      renderSettingsUI();
+      toolGroupStates.set(btn, nextList);
     }
   }
 
@@ -857,60 +1618,60 @@
     ensureGlobalStyles();
     dockToTitlebar();
 
-    const triggers = document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]');
-    const now = Date.now();
+    const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
     const targetLang = getEffectiveTargetLang(settings);
     const model = settings.model || DEFAULT_MODEL;
+    const prewarmItems = [];
+    const total = triggers.length;
 
-    for (const trigger of triggers) {
+    for (let idx = 0; idx < total; idx++) {
+      const trigger = triggers[idx];
       const wrapper = trigger.parentElement;
       if (!wrapper) continue;
+
+      const isNew = !blockStates.has(wrapper);
       const st = getOrInitBlockState(wrapper);
+      if (isNew && !initialScanDone) {
+        st.seenOnInitialScan = true;
+      }
+
       const streamingNow = isTriggerStreaming(trigger);
-      const group = getGroupContainer(wrapper);
-      const origDiv = getOrigContentDiv(group);
+      if (streamingNow) st.wasStreaming = true;
+      else if (st.wasStreaming) st.wasStreaming = false;
 
-      if (origDiv) {
-        const text = normalizeThinkingText(origDiv.innerText || origDiv.textContent || '');
-        if (text && text !== st.lastOrigText) {
-          st.lastOrigText = text;
-          st.lastGrowthAt = now;
+      const viewport = getViewportContainer(wrapper, trigger);
+      const markdownRoot = viewport ? findMarkdownRoot(viewport) : null;
+
+      if (markdownRoot) {
+        st.fiberBlocks = [];
+        syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems);
+      } else {
+        // Clear stale DOM maps if collapsed
+        if (st.domParas.size > 0) {
+          for (const p of st.domParas.values()) {
+            if (p.transEl?.isConnected) p.transEl.remove();
+          }
+          st.domParas.clear();
+          st.orderedOrigEls = [];
+        }
+        const fiberThinking = extractThinkingFromFiber(trigger);
+        if (fiberThinking) {
+          const isRecentOrLive = !st.seenOnInitialScan || streamingNow || st.wasStreaming || idx >= total - 2;
+          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems);
+        } else {
+          syncWrapperModeAndOrigVisibility(wrapper, st);
         }
       }
+    }
 
-      if (streamingNow) {
-        st.wasStreaming = true;
-      }
+    scanCollapsedToolGroups(targetLang, model, prewarmItems);
 
-      const justFinishedStreaming = st.wasStreaming && !streamingNow;
-      if (justFinishedStreaming) {
-        st.wasStreaming = false;
-      }
+    if (!initialScanDone) {
+      initialScanDone = true;
+    }
 
-      const key = st.lastOrigText ? computeCacheKey(st.lastOrigText, targetLang, model) : '';
-      const needsTranslation = Boolean(
-        settings.enabled &&
-        st.lastOrigText &&
-        st.cacheKey !== key &&
-        st.status !== 'translating' &&
-        shouldTranslateText(st.lastOrigText, targetLang)
-      );
-
-      if (needsTranslation) {
-        const pausedLongEnough = streamingNow && st.lastGrowthAt > 0 && (now - st.lastGrowthAt >= LIVE_STREAM_PAUSE_MS);
-        const expandedAndReady = Boolean(group) && !streamingNow;
-        if (justFinishedStreaming || expandedAndReady || pausedLongEnough || st.autoTranslateOnExpand) {
-          st.autoTranslateOnExpand = false;
-          void translateBlock(wrapper, false);
-          continue;
-        }
-      } else if (st.autoTranslateOnExpand && group) {
-        st.autoTranslateOnExpand = false;
-        void translateBlock(wrapper, false);
-        continue;
-      }
-
-      syncBlockDOM(wrapper, st);
+    if (prewarmItems.length > 0) {
+      void prewarmBackendCache(prewarmItems, targetLang, model);
     }
   }
 
@@ -922,13 +1683,34 @@
     }, 150);
   }
 
+  function isPluginNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    return (
+      node.id === HOST_ID ||
+      node.id === GLOBAL_STYLE_ID ||
+      node.hasAttribute('data-ag-tt-para') ||
+      node.hasAttribute('data-ag-tt-ui') ||
+      node.classList?.contains('ag-tt-token-in') ||
+      node.classList?.contains('ag-tt-stream-caret')
+    );
+  }
+
   function isPluginMutation(mutations) {
     for (const m of mutations) {
+      if (m.type === 'attributes' && m.attributeName && m.attributeName.startsWith('data-ag-tt-')) {
+        continue;
+      }
+      if (m.type === 'childList') {
+        const addedOk = Array.from(m.addedNodes).every(n => n.nodeType !== 1 || isPluginNode(n));
+        const removedOk = Array.from(m.removedNodes).every(n => n.nodeType !== 1 || isPluginNode(n));
+        if (addedOk && removedOk && (m.addedNodes.length > 0 || m.removedNodes.length > 0)) {
+          continue;
+        }
+      }
       const target = m.target;
       if (!target) continue;
       const elTarget = target.nodeType === 1 ? target : target.parentElement;
-      if (!elTarget || !elTarget.closest) continue;
-      if (elTarget.closest(`#${HOST_ID}, [data-ag-tt-card], .ag-tt-trigger-badge, #${GLOBAL_STYLE_ID}`)) {
+      if (elTarget && elTarget.closest && elTarget.closest(`#${HOST_ID}, [data-ag-tt-para], [data-ag-tt-ui], #${GLOBAL_STYLE_ID}`)) {
         continue;
       }
       return false;
@@ -968,10 +1750,6 @@
       void persistSettings({ enabled: ev.target.checked });
     });
 
-    el('tt-auto-expand')?.addEventListener('change', ev => {
-      void persistSettings({ autoExpandHeight: ev.target.checked });
-    });
-
     el('tt-target-lang')?.addEventListener('change', ev => {
       const val = ev.target.value;
       void persistSettings({ targetLang: val });
@@ -1001,8 +1779,19 @@
       void persistSettings({ displayMode: 'translation_only' });
     });
 
-    el('tt-model')?.addEventListener('change', ev => {
-      void persistSettings({ model: ev.target.value });
+    el('tt-model-base')?.addEventListener('change', ev => {
+      const groups = groupModelsForCascade(getEffectiveModelsList());
+      const resolved = resolveCascadeSelection(groups, settings.model, ev.target.value, preferredLevelKey);
+      if (resolved.levelKey) preferredLevelKey = resolved.levelKey;
+      void persistSettings({ model: resolved.modelId });
+    });
+
+    el('tt-model-level')?.addEventListener('change', ev => {
+      const chosenId = ev.target.value;
+      const groups = groupModelsForCascade(getEffectiveModelsList());
+      const resolved = resolveCascadeSelection(groups, chosenId);
+      if (resolved.levelKey) preferredLevelKey = resolved.levelKey;
+      void persistSettings({ model: chosenId });
     });
 
     el('tt-refresh-models')?.addEventListener('click', async ev => {
@@ -1019,7 +1808,7 @@
         lastErrorMsg = err?.message || String(err);
         renderSettingsUI();
       } finally {
-        btn.textContent = '刷新';
+        btn.textContent = '↻ 刷新';
         btn.disabled = false;
       }
     });
@@ -1027,9 +1816,7 @@
     el('tt-translate-now')?.addEventListener('click', () => {
       for (const wrapper of Array.from(trackedWrappers)) {
         if (!wrapper.isConnected) continue;
-        if (getGroupContainer(wrapper)) {
-          void translateBlock(wrapper, false);
-        }
+        void translateWrapperNow(wrapper, false);
       }
     });
 
@@ -1037,16 +1824,9 @@
       try {
         await callBridge('/clear-cache', {});
         cacheCount = 0;
-        for (const wrapper of Array.from(trackedWrappers)) {
-          const st = blockStates.get(wrapper);
-          if (st) {
-            st.status = 'idle';
-            st.translation = '';
-            st.cacheKey = '';
-            syncBlockDOM(wrapper, st);
-          }
-        }
+        resetAllTranslationStates(true);
         renderSettingsUI();
+        scheduleScan();
       } catch (err) {
         lastErrorMsg = err?.message || String(err);
         renderSettingsUI();
@@ -1100,7 +1880,7 @@
         subtree: true,
         characterData: true,
         attributes: true,
-        attributeFilter: ['aria-expanded', 'class']
+        attributeFilter: ['aria-expanded']
       });
     }
 
@@ -1116,23 +1896,35 @@
     disposed = true;
     if (scanTimer) clearTimeout(scanTimer);
     if (pollTimer) clearInterval(pollTimer);
+    if (rafId) cancelAnimationFrame(rafId);
+    highQueue.length = 0;
+    bgQueue.length = 0;
     try { themeObserver?.disconnect(); } catch {}
     try { domObserver?.disconnect(); } catch {}
     try { titlebarResizeObserver?.disconnect(); } catch {}
     if (docClickHandler) document.removeEventListener('click', docClickHandler);
     window.removeEventListener('resize', positionPopover);
+
     for (const wrapper of Array.from(trackedWrappers)) {
       if (!wrapper.isConnected) continue;
-      for (const b of wrapper.querySelectorAll(':scope > .ag-tt-trigger-badge')) b.remove();
-      const group = getGroupContainer(wrapper);
-      if (group) {
-        group.removeAttribute('data-ag-tt-has-card');
-        group.removeAttribute('data-ag-tt-hide-orig');
-        for (const c of group.querySelectorAll(':scope > [data-ag-tt-card]')) c.remove();
+      wrapper.removeAttribute('data-ag-tt-wrapper');
+      wrapper.removeAttribute('data-ag-tt-mode');
+      wrapper.removeAttribute('data-ag-tt-active');
+      for (const bar of wrapper.querySelectorAll(':scope > .ag-tt-trigger-bar, :scope > [data-ag-tt-ui]')) {
+        bar.remove();
+      }
+      for (const p of wrapper.querySelectorAll('[data-ag-tt-para]')) {
+        p.remove();
+      }
+      for (const orig of wrapper.querySelectorAll('[data-ag-tt-orig-ready]')) {
+        orig.removeAttribute('data-ag-tt-orig-ready');
       }
     }
+
+    for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
-    document.documentElement.removeAttribute('data-ag-tt-expand');
+    memCache.clear();
+    checkedCanonMisses.clear();
     try { document.getElementById(GLOBAL_STYLE_ID)?.remove(); } catch {}
     try { host.remove(); } catch {}
   }
@@ -1155,7 +1947,7 @@
     }),
     translateAllVisible: () => {
       for (const w of Array.from(trackedWrappers)) {
-        if (w.isConnected && getGroupContainer(w)) void translateBlock(w, false);
+        if (w.isConnected) void translateWrapperNow(w, false);
       }
     }
   };

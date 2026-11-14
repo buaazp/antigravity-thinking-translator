@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { getStateDir, getDevToolsPort } = require('./tt-asar');
+const { PLUGIN_VERSION } = require('./tt-core');
 
 function isTestMode() {
   return process.env.AG_TT_TEST_MODE === '1' || process.env.NODE_ENV === 'test';
@@ -113,7 +114,15 @@ function readLiveSessionInfo(stateDir) {
 async function ensureLiveBridge(expectedOrigin, options = {}) {
   const stateDir = options.stateDir || getStateDir();
   const { sessionPath, info } = readLiveSessionInfo(stateDir);
-  if (info && info.pid && info.port && info.token && (!expectedOrigin || info.origin === expectedOrigin)) {
+  if (
+    !options.restart &&
+    info &&
+    info.pid &&
+    info.port &&
+    info.token &&
+    info.version === PLUGIN_VERSION &&
+    (!expectedOrigin || info.origin === expectedOrigin)
+  ) {
     try {
       process.kill(info.pid, 0);
       return info;
@@ -121,7 +130,7 @@ async function ensureLiveBridge(expectedOrigin, options = {}) {
   }
 
   if (info && info.pid) {
-    try { process.kill(info.pid); } catch {}
+    try { process.kill(info.pid, 'SIGTERM'); } catch {}
   }
   try { if (fs.existsSync(sessionPath)) fs.unlinkSync(sessionPath); } catch {}
 
@@ -167,12 +176,15 @@ async function injectIntoLiveWindows(options = {}) {
   let injectedCount = 0;
   for (const page of info.pages) {
     const origin = new URL(page.url).origin;
-    const hasIpc = await evalInPage(page.webSocketDebuggerUrl, 'Boolean(window.thinkingTranslatorAPI)').catch(() => false);
-    if (!hasIpc) {
+    const ipcVersion = await evalInPage(
+      page.webSocketDebuggerUrl,
+      'window.thinkingTranslatorAPI ? (window.thinkingTranslatorAPI.version || "legacy") : null'
+    ).catch(() => null);
+    if (!ipcVersion || ipcVersion !== PLUGIN_VERSION) {
       const liveSession = await ensureLiveBridge(origin, options);
       await evalInPage(
         page.webSocketDebuggerUrl,
-        `window.__AGThinkingTranslatorLive = ${JSON.stringify({ port: liveSession.port, token: liveSession.token })};`
+        `window.__AGThinkingTranslatorLive = ${JSON.stringify({ port: liveSession.port, token: liveSession.token, version: PLUGIN_VERSION })};`
       );
     }
     await evalInPage(page.webSocketDebuggerUrl, bundle);

@@ -6,13 +6,16 @@ In Google Antigravity 2.x, reasoning models emit their internal `Thinking` strea
 
 ## Features
 
-- **Zero impact on reasoning quality**: Prompts, rules, and backend calls are untouched. Translation runs asynchronously on the client after/as thinking text appears.
-- **Reuses built-in Antigravity models**: Invokes your authenticated `agy` CLI (`stream-json` persistent worker with one-shot JSON fallback), defaulting to **`Gemini 4 Hydrogen (Medium)`** (`gemini-4-hydrogen-medium`), and lets you switch to any model from `agy models`.
+- **Zero impact on reasoning quality**: Prompts, rules, and backend calls are untouched. Models continue thinking in English while translations stream asynchronously paragraph by paragraph on the client.
+- **Paragraph-level interleaved streaming & background pre-translation**:
+  - Inserts translated paragraphs directly beneath each corresponding original paragraph (while preserving code blocks untouched).
+  - Translates completed paragraphs immediately during live thinking and pre-translates collapsed/tool-grouped thinking blocks in the background so expanding them is instant.
+  - Pooled persistent `agy` workers (up to 4 concurrent workers) translate paragraphs in parallel with jitter-free `requestAnimationFrame` token fade-in rendering.
+- **Cascading model + thinking-level selector**: First choose the model family (e.g., `Gemini 4 Hydrogen`, `Gemini 3.8 Flash`, `Claude Sonnet 5.5`), then choose the effort level dynamically filtered for that model (defaults to `Gemini 4 Hydrogen` + `Medium`).
 - **Two display modes**:
-  - **Bilingual (`显示原文和译文`)**: Keeps the original English thinking visible and appends a formatted translation card beneath it.
-  - **Translation Only (`只显示译文`)**: Hides the original English block via React-safe CSS once translation is available, with per-block toggle buttons to peek at the original text anytime.
-- **Configurable target language**: Built-in presets (Simplified Chinese, Traditional Chinese, Japanese, Korean, Spanish, French, German, Russian, Portuguese) plus free-form custom language input.
-- **Persistent LRU cache & live streaming preview**: Caches up to 500 translations locally and streams partial output live for long thinking traces.
+  - **Bilingual (`显示原文和译文`)**: Shows each translated paragraph inline below its English source paragraph.
+  - **Translation Only (`只显示译文`)**: Swaps each English paragraph out cleanly once its translation begins streaming, with per-block buttons to toggle back to bilingual view, re-translate, or copy.
+- **Configurable target language & canonical LRU cache**: Supports preset & custom target languages, and indexes cache entries with formatting-agnostic canonical keys so background pre-translations match DOM blocks seamlessly.
 - **Coexists with `antigravity-context-viewer`**: Uses isolated `tt-*` files and paired injection markers so both plugins can be installed, updated, and restored independently.
 
 ## Quick Start

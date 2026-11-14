@@ -7,7 +7,7 @@
   <div class="tt-header">
     <div class="tt-title-wrap">
       <span>思考过程翻译</span>
-      <span id="tt-version" class="tt-version">v0.1.0</span>
+      <span id="tt-version" class="tt-version">v0.2.0</span>
     </div>
     <button id="tt-close" class="tt-close" type="button" title="关闭">✕</button>
   </div>
@@ -37,19 +37,20 @@
   </div>
 
   <div class="tt-row">
-    <label class="tt-label" for="tt-model">翻译模型（复用 Antigravity 内置模型）</label>
-    <div class="tt-model-bar">
-      <select id="tt-model" class="tt-select"></select>
-      <button id="tt-refresh-models" class="tt-icon-btn" type="button" title="从 agy models 刷新可用模型">刷新</button>
+    <div class="tt-label-bar">
+      <label class="tt-label" for="tt-model-base">翻译模型（复用 Antigravity 内置模型）</label>
+      <button id="tt-refresh-models" class="tt-link-btn" type="button" title="从 agy models 刷新可用模型">↻ 刷新</button>
     </div>
-  </div>
-
-  <div class="tt-row-inline">
-    <span class="tt-label-inline">双语/译文展开更大高度</span>
-    <label class="tt-switch">
-      <input id="tt-auto-expand" type="checkbox" checked>
-      <span class="tt-slider"></span>
-    </label>
+    <div class="tt-model-cascade">
+      <div class="tt-cascade-col">
+        <span class="tt-sublabel">模型</span>
+        <select id="tt-model-base" class="tt-select" aria-label="翻译模型"></select>
+      </div>
+      <div class="tt-cascade-col">
+        <span class="tt-sublabel">思考等级</span>
+        <select id="tt-model-level" class="tt-select" aria-label="思考等级"></select>
+      </div>
+    </div>
   </div>
 
   <div class="tt-actions">

@@ -78,6 +78,7 @@ test('install and restore coexist cleanly with antigravity-context-viewer and pr
     assert.ok(utilsAfter1.includes('installThinkingTranslator'));
     assert.ok(utilsAfter1.includes('installContextMeter'));
     assert.ok(preloadAfter1.includes('"thinkingTranslatorAPI"'));
+    assert.ok(preloadAfter1.includes('checkCache'));
     assert.ok(preloadAfter1.includes('"contextMeterAPI"'));
     assert.equal(verifyHostUtilsStructure(utilsAfter1), true);
     assert.equal(extractFile(asarPath, 'dist/host-untouched.txt').toString('utf8'), 'original-host-asset-bytes');

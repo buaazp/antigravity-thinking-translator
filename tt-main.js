@@ -131,6 +131,11 @@ function registerIpcOnce() {
     return listAvailableModels(opts || {});
   });
 
+  ipcMain.handle('thinking-translator:check-cache', (event, payload) => {
+    if (!isLocalMainFrameSender(event)) throw new Error('Unauthorized sender');
+    return service.checkCache(payload || {});
+  });
+
   ipcMain.handle('thinking-translator:clear-cache', event => {
     if (!isLocalMainFrameSender(event)) throw new Error('Unauthorized sender');
     service.cache.clear();

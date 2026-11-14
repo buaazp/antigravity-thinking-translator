@@ -62,19 +62,26 @@ if (args.includes('--input-format') && args.includes('stream-json')) {
       return;
     }
     const tr = '中文译文: ' + src;
-    const mid = Math.ceil(tr.length / 2);
-    process.stdout.write(JSON.stringify({
-      event: 'step_update',
-      step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: tr.slice(0, mid) }
-    }) + '\\n');
-    process.stdout.write(JSON.stringify({
-      event: 'step_update',
-      step_update: { step_type: 'agent_response', state: 'DONE', text_delta: tr.slice(mid) }
-    }) + '\\n');
-    process.stdout.write(JSON.stringify({
-      event: 'result',
-      result: { status: 'SUCCESS', response: tr }
-    }) + '\\n');
+    const emit = () => {
+      const mid = Math.ceil(tr.length / 2);
+      process.stdout.write(JSON.stringify({
+        event: 'step_update',
+        step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: tr.slice(0, mid) }
+      }) + '\\n');
+      process.stdout.write(JSON.stringify({
+        event: 'step_update',
+        step_update: { step_type: 'agent_response', state: 'DONE', text_delta: tr.slice(mid) }
+      }) + '\\n');
+      process.stdout.write(JSON.stringify({
+        event: 'result',
+        result: { status: 'SUCCESS', response: tr }
+      }) + '\\n');
+    };
+    if (src.includes('PARALLEL_')) {
+      setTimeout(emit, 70);
+    } else {
+      emit();
+    }
   });
   process.on('SIGTERM', () => {
     // Reproduce real agy trailing ERROR result on shutdown
@@ -158,6 +165,38 @@ test('settings persistence, model discovery, warm stream-json translation, cachi
     const fallbackRes = await service.translate({ text: 'FORCE_STREAM_ERROR trigger fallback' });
     assert.equal(fallbackRes.ok, true);
     assert.ok(fallbackRes.translation.startsWith('一次性译文:'));
+
+    // 7. Canonical cache hit matches raw Markdown translated earlier with DOM plain text
+    const mdRes = await service.translate({ text: 'Inspect **bold** `src/app.js` file.' });
+    assert.equal(mdRes.ok, true);
+    assert.equal(mdRes.cached, false);
+    const checkRes = service.checkCache({
+      items: [
+        { id: 'p1', text: 'Inspect bold src/app.js file.' },
+        { id: 'p2', text: 'Never seen before paragraph.' }
+      ]
+    });
+    assert.equal(checkRes.ok, true);
+    assert.equal(checkRes.hits.p1, mdRes.translation);
+    assert.equal(checkRes.hits.p2, undefined);
+
+    // 8. Concurrent paragraph pool dispatches parallel workers when multiple requests arrive together
+    const [p1, p2, p3] = await Promise.all([
+      service.translate({ text: 'PARALLEL_1 paragraph alpha.' }),
+      service.translate({ text: 'PARALLEL_2 paragraph beta.' }),
+      service.translate({ text: 'PARALLEL_3 paragraph gamma.' })
+    ]);
+    assert.equal(p1.ok, true);
+    assert.equal(p2.ok, true);
+    assert.equal(p3.ok, true);
+    const workerInvocations = fs.readFileSync(counterFile, 'utf8').trim().split('\n').filter(Boolean).length;
+    assert.ok(workerInvocations >= 3 && workerInvocations <= 5, `expected pooled workers, got ${workerInvocations}`);
+
+    // Subsequent sequential call reuses an idle warm worker without spawning another process
+    const seqRes = await service.translate({ text: 'Fourth sequential step reusing warm pool.' });
+    assert.equal(seqRes.ok, true);
+    const workerInvocationsAfterSeq = fs.readFileSync(counterFile, 'utf8').trim().split('\n').filter(Boolean).length;
+    assert.equal(workerInvocationsAfterSeq, workerInvocations);
   } finally {
     service.dispose();
     await new Promise(r => setTimeout(r, 80));

@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.1.0';
+  const PLUGIN_VERSION = '0.2.0';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const CUSTOM_LANG_VALUE = '__custom__';
 
@@ -33,19 +33,53 @@
     { id: 'gemini-4-hydrogen-high', label: 'Gemini 4 Hydrogen (High)' },
     { id: 'gemini-4-hydrogen-xhigh', label: 'Gemini 4 Hydrogen (XHigh)' },
     { id: 'gemini-4-carbon-medium', label: 'Gemini 4 Carbon (Medium)' },
-    { id: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon (High)' },
     { id: 'gemini-4-carbon-low', label: 'Gemini 4 Carbon (Low)' },
+    { id: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon (High)' },
     { id: 'gemini-4-argon-medium', label: 'Gemini 4 Argon (Medium)' },
-    { id: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)' },
     { id: 'gemini-4-argon-low', label: 'Gemini 4 Argon (Low)' },
+    { id: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)' },
     { id: 'gemini-3.8-flash-medium', label: 'Gemini 3.8 Flash (Medium)' },
     { id: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' },
     { id: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)' },
     { id: 'gemini-pro-orchestrator', label: 'Orchestrator (Carbon)' },
     { id: 'gemini-pro-orchestrator-argon', label: 'Orchestrator (Argon)' },
+    { id: 'claude-sonnet-5-5-low', label: 'Claude Sonnet 5.5 (Low)' },
     { id: 'claude-sonnet-5-5-medium', label: 'Claude Sonnet 5.5 (Medium)' },
+    { id: 'claude-sonnet-5-5-high', label: 'Claude Sonnet 5.5 (High)' },
+    { id: 'claude-opus-5-5-low', label: 'Claude Opus 5.5 (Low)' },
     { id: 'claude-opus-5-5-medium', label: 'Claude Opus 5.5 (Medium)' },
+    { id: 'claude-opus-5-5-high', label: 'Claude Opus 5.5 (High)' },
     { id: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' }
+  ];
+
+  const LEVEL_DISPLAY_MAP = {
+    minimal: 'Minimal (极低)',
+    low: 'Low (低)',
+    medium: 'Medium (中)',
+    high: 'High (高)',
+    xhigh: 'XHigh (超高)',
+    max: 'Max (极高)',
+    default: '默认 (Default)'
+  };
+
+  const LEVEL_RANK_MAP = {
+    minimal: 5,
+    low: 10,
+    medium: 20,
+    high: 30,
+    xhigh: 40,
+    max: 50
+  };
+
+  const PREFERRED_BASE_ORDER = [
+    'gemini-4-hydrogen',
+    'gemini-4-carbon',
+    'gemini-4-argon',
+    'gemini-3.8-flash',
+    'orchestrator',
+    'claude-sonnet-5.5',
+    'claude-opus-5.5',
+    'gpt-oss-120b'
   ];
 
   const DEFAULT_SETTINGS = {
@@ -120,6 +154,193 @@
     const h1 = fnv1aHex(payload, 0x811c9dc5);
     const h2 = fnv1aHex(payload.split('').reverse().join(''), 0x9e3779b9);
     return `${h1}${h2}:${norm.length}`;
+  }
+
+  function canonicalizeForCache(text) {
+    return normalizeThinkingText(text)
+      .replace(/^```[^\n]*$/gm, ' ')
+      .replace(/```/g, ' ')
+      .replace(/`([^`\n]+)`/g, '$1')
+      .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+      .replace(/__([^_\n]+)__/g, '$1')
+      .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+      .replace(/^\s*(?:[-*•]|\d+\.)\s+/gm, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function computeCanonicalCacheKey(text, targetLang, model) {
+    const canon = canonicalizeForCache(text);
+    const lang = String(targetLang || '简体中文').trim();
+    const mdl = String(model || DEFAULT_MODEL).trim();
+    const payload = `${mdl}\u0000${lang}\u0000${canon}`;
+    const h1 = fnv1aHex(payload, 0x811c9dc5);
+    const h2 = fnv1aHex(payload.split('').reverse().join(''), 0x9e3779b9);
+    return `canon:${h1}${h2}:${canon.length}`;
+  }
+
+  function splitMarkdownIntoBlocks(markdown) {
+    const src = normalizeThinkingText(markdown);
+    if (!src) return [];
+
+    const segments = [];
+    const fenceRe = /```[A-Za-z0-9_+-]*\n[\s\S]*?```/g;
+    let lastIdx = 0;
+    let match;
+    while ((match = fenceRe.exec(src)) !== null) {
+      if (match.index > lastIdx) {
+        segments.push({ type: 'text', value: src.slice(lastIdx, match.index) });
+      }
+      segments.push({ type: 'code', value: match[0] });
+      lastIdx = fenceRe.lastIndex;
+    }
+    if (lastIdx < src.length) {
+      const rest = src.slice(lastIdx);
+      const unclosedIdx = rest.indexOf('```');
+      if (unclosedIdx !== -1) {
+        if (unclosedIdx > 0) {
+          segments.push({ type: 'text', value: rest.slice(0, unclosedIdx) });
+        }
+        segments.push({ type: 'code', value: rest.slice(unclosedIdx) });
+      } else {
+        segments.push({ type: 'text', value: rest });
+      }
+    }
+
+    const blocks = [];
+    for (const seg of segments) {
+      if (seg.type === 'code') {
+        const text = seg.value.trim();
+        if (text) blocks.push({ type: 'code', text });
+        continue;
+      }
+      const chunks = seg.value.split(/\n{2,}/);
+      for (const raw of chunks) {
+        const text = raw.trim();
+        if (!text) continue;
+        if (/^[-*_]{3,}$/.test(text)) {
+          blocks.push({ type: 'hr', text });
+        } else {
+          blocks.push({ type: 'prose', text });
+        }
+      }
+    }
+    return blocks;
+  }
+
+  function parseModelDescriptor(item) {
+    const raw = item && typeof item === 'object' ? item : { id: String(item || ''), label: String(item || '') };
+    const id = String(raw.id || '').trim();
+    const label = String(raw.label || id).trim();
+    const m = label.match(/^(.+?)\s*\(([^()]+)\)\s*$/);
+    const baseLabel = m ? m[1].trim() : label;
+    const levelRaw = m ? m[2].trim() : 'Default';
+    const baseKey = baseLabel.toLowerCase().replace(/\s+/g, '-');
+    const levelKey = levelRaw.toLowerCase().trim();
+    const levelDisplay = LEVEL_DISPLAY_MAP[levelKey] || levelRaw;
+    return {
+      id,
+      label,
+      baseKey,
+      baseLabel,
+      levelKey,
+      levelRaw,
+      levelDisplay
+    };
+  }
+
+  function groupModelsForCascade(models) {
+    const list = Array.isArray(models) && models.length ? models : FALLBACK_MODELS;
+    const groupsMap = new Map();
+    let orderCounter = 0;
+
+    for (const item of list) {
+      const desc = parseModelDescriptor(item);
+      if (!desc.id) continue;
+      let group = groupsMap.get(desc.baseKey);
+      if (!group) {
+        group = {
+          baseKey: desc.baseKey,
+          baseLabel: desc.baseLabel,
+          _discoverIdx: orderCounter++,
+          options: []
+        };
+        groupsMap.set(desc.baseKey, group);
+      }
+      if (!group.options.some(o => o.id === desc.id)) {
+        group.options.push({ ...desc, _discoverIdx: group.options.length });
+      }
+    }
+
+    const groups = Array.from(groupsMap.values());
+    groups.sort((a, b) => {
+      const ia = PREFERRED_BASE_ORDER.indexOf(a.baseKey);
+      const ib = PREFERRED_BASE_ORDER.indexOf(b.baseKey);
+      if (ia !== -1 && ib !== -1) return ia - ib;
+      if (ia !== -1) return -1;
+      if (ib !== -1) return 1;
+      return a._discoverIdx - b._discoverIdx;
+    });
+
+    return groups.map(g => {
+      const sortedOpts = g.options.slice().sort((a, b) => {
+        const ra = Object.prototype.hasOwnProperty.call(LEVEL_RANK_MAP, a.levelKey)
+          ? LEVEL_RANK_MAP[a.levelKey]
+          : 100 + a._discoverIdx;
+        const rb = Object.prototype.hasOwnProperty.call(LEVEL_RANK_MAP, b.levelKey)
+          ? LEVEL_RANK_MAP[b.levelKey]
+          : 100 + b._discoverIdx;
+        return ra - rb;
+      }).map(({ _discoverIdx, ...rest }) => rest);
+
+      return {
+        baseKey: g.baseKey,
+        baseLabel: g.baseLabel,
+        options: sortedOpts
+      };
+    });
+  }
+
+  function resolveCascadeSelection(groups, currentModelId, targetBaseKey = null, preferredLevelKey = null) {
+    const list = Array.isArray(groups) && groups.length ? groups : groupModelsForCascade(FALLBACK_MODELS);
+    if (!targetBaseKey) {
+      for (const group of list) {
+        const matched = group.options.find(o => o.id === currentModelId);
+        if (matched) {
+          return {
+            group,
+            option: matched,
+            modelId: matched.id,
+            baseKey: group.baseKey,
+            levelKey: matched.levelKey
+          };
+        }
+      }
+      const fallbackGroup = list[0];
+      const fallbackOpt = fallbackGroup.options.find(o => o.levelKey === 'medium') || fallbackGroup.options[0];
+      return {
+        group: fallbackGroup,
+        option: fallbackOpt,
+        modelId: fallbackOpt.id,
+        baseKey: fallbackGroup.baseKey,
+        levelKey: fallbackOpt.levelKey
+      };
+    }
+
+    const group = list.find(g => g.baseKey === targetBaseKey) || list[0];
+    const pref = preferredLevelKey ? String(preferredLevelKey).toLowerCase().trim() : '';
+    const option =
+      (pref && group.options.find(o => o.levelKey === pref)) ||
+      group.options.find(o => o.levelKey === 'medium') ||
+      group.options[0];
+
+    return {
+      group,
+      option,
+      modelId: option.id,
+      baseKey: group.baseKey,
+      levelKey: option.levelKey
+    };
   }
 
   function stripCodeSegments(text) {
@@ -331,6 +552,61 @@
     return htmlParts.join('');
   }
 
+  function injectCaretBeforeLastClose(html) {
+    const caret = '<span class="ag-tt-stream-caret" aria-hidden="true"></span>';
+    const closeMatch = html.match(/(<\/(?:p|li|h[1-6]|pre)>)\s*$/);
+    if (closeMatch) {
+      const idx = closeMatch.index;
+      return html.slice(0, idx) + caret + html.slice(idx);
+    }
+    return html + caret;
+  }
+
+  function renderStreamingMarkdownHtml(sliceText, prevRevealedLen, isStreaming) {
+    const src = String(sliceText || '').replace(/\r\n?/g, '\n');
+    if (!src.trim()) return '';
+    if (!isStreaming) {
+      return renderSafeMarkdownHtml(src);
+    }
+
+    // Split on the last blank-line paragraph boundary so finished paragraphs stay intact
+    const lastBlankIdx = src.lastIndexOf('\n\n');
+    const headRaw = lastBlankIdx > 0 ? src.slice(0, lastBlankIdx) : '';
+    const activePara = lastBlankIdx > 0 ? src.slice(lastBlankIdx + 2) : src;
+
+    const headFences = (headRaw.match(/```/g) || []).length;
+    if (headFences % 2 === 1) {
+      return injectCaretBeforeLastClose(renderSafeMarkdownHtml(src));
+    }
+
+    const headHtml = headRaw ? renderSafeMarkdownHtml(headRaw) : '';
+    const activeTrimmed = activePara.trimEnd();
+    const isSimplePara =
+      activeTrimmed &&
+      !activeTrimmed.includes('\n') &&
+      !activeTrimmed.includes('```') &&
+      !/^\s*(?:#{1,4}\s|[-*•]\s|\d+\.\s)/.test(activeTrimmed);
+
+    if (isSimplePara) {
+      const activeOffset = lastBlankIdx > 0 ? lastBlankIdx + 2 : 0;
+      let cut = Math.max(0, Math.min(activeTrimmed.length, (Number(prevRevealedLen) || 0) - activeOffset));
+      if (cut > 0 && cut < activeTrimmed.length) {
+        const prefix = activeTrimmed.slice(0, cut);
+        const unclosedTick = (prefix.match(/`/g) || []).length % 2 === 1;
+        const unclosedBold = (prefix.match(/\*\*/g) || []).length % 2 === 1;
+        if (!unclosedTick && !unclosedBold) {
+          const fresh = activeTrimmed.slice(cut);
+          return `${headHtml}<p>${formatInlineMarkdown(escapeHtml(prefix))}<span class="ag-tt-token-in">${formatInlineMarkdown(escapeHtml(fresh))}</span><span class="ag-tt-stream-caret" aria-hidden="true"></span></p>`;
+        }
+      }
+      if (cut === 0) {
+        return `${headHtml}<p><span class="ag-tt-token-in">${formatInlineMarkdown(escapeHtml(activeTrimmed))}</span><span class="ag-tt-stream-caret" aria-hidden="true"></span></p>`;
+      }
+    }
+
+    return headHtml + injectCaretBeforeLastClose(renderSafeMarkdownHtml(activePara));
+  }
+
   return {
     PLUGIN_VERSION,
     DEFAULT_MODEL,
@@ -342,11 +618,18 @@
     getEffectiveTargetLang,
     normalizeThinkingText,
     computeCacheKey,
+    canonicalizeForCache,
+    computeCanonicalCacheKey,
+    splitMarkdownIntoBlocks,
+    parseModelDescriptor,
+    groupModelsForCascade,
+    resolveCascadeSelection,
     shouldTranslateText,
     buildTranslationPrompt,
     cleanModelTranslationOutput,
     parseAgyModelsOutput,
     escapeHtml,
-    renderSafeMarkdownHtml
+    renderSafeMarkdownHtml,
+    renderStreamingMarkdownHtml
   };
 });
