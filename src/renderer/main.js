@@ -31,7 +31,8 @@
     translateBoilerplateTitle,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
-    escapeHtml
+    escapeHtml,
+    orderItemsVisibleFirstReverse
   } = core;
 
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
@@ -62,6 +63,7 @@
   let pollTimer = 0;
   let batchFlushTimer = 0;
   let batchFlushAt = 0;
+  let scrollPromoteTimer = 0;
   let rafId = 0;
   let lastAnimTick = 0;
   let hoverDwellTimer = 0;
@@ -76,6 +78,7 @@
   let docClickHandler = null;
   let docMouseOverHandler = null;
   let docMouseOutHandler = null;
+  let docScrollHandler = null;
   let reqSeq = 0;
   let initialScanDone = false;
 
@@ -93,9 +96,10 @@
   const memCache = new Map();
   const checkedCanonMisses = new Set();
 
-  // 3-tier coalescing batch scheduler: Priority 0 titles > Priority 1 expanded/live prose > Priority 2 bg prose
+  // 4-tier coalescing batch scheduler: Priority 0 titles > Priority 1 visible prose > Priority 2 high offscreen prose > Priority 3 bg prose
   let activeBatchCount = 0;
   const titleQueue = [];
+  const visibleQueue = [];
   const highQueue = [];
   const bgQueue = [];
   const activeTasks = new Map(); // taskKey -> Task
@@ -818,7 +822,11 @@
       batchFlushTimer = 0;
       batchFlushAt = 0;
     }
-    for (const q of [titleQueue, highQueue, bgQueue]) {
+    if (scrollPromoteTimer) {
+      clearTimeout(scrollPromoteTimer);
+      scrollPromoteTimer = 0;
+    }
+    for (const q of [titleQueue, visibleQueue, highQueue, bgQueue]) {
       while (q.length) {
         const task = q.shift();
         if (task && !task.running) {
@@ -1126,14 +1134,102 @@
   }
 
   // =========================================================================
-  // 3-Tier Coalescing Batch Scheduler (Priority 0 Titles > Expanded > Bg)
+  // 4-Tier Coalescing Batch Scheduler (Titles > Visible > High Offscreen > Bg)
   // =========================================================================
-  const PRIORITY_RANK = { title: 0, high: 1, bg: 2 };
+  const PRIORITY_RANK = { title: 0, visible: 1, high: 2, bg: 3 };
 
   function getQueueByPriority(priority) {
     if (priority === 'title') return titleQueue;
+    if (priority === 'visible') return visibleQueue;
     if (priority === 'high') return highQueue;
     return bgQueue;
+  }
+
+  function captureQueueSnapshot() {
+    return {
+      title: titleQueue.length,
+      visible: visibleQueue.length,
+      high: highQueue.length
+    };
+  }
+
+  function promoteNewQueueTasksToFront(snap) {
+    if (!snap) return;
+    const pairs = [
+      [titleQueue, snap.title],
+      [visibleQueue, snap.visible],
+      [highQueue, snap.high]
+    ];
+    for (const [q, prevLen] of pairs) {
+      if (prevLen > 0 && q.length > prevLen) {
+        const added = q.splice(prevLen);
+        q.unshift(...added);
+      }
+    }
+  }
+
+  function isElementInVisibleViewport(el, scrollContainer = null) {
+    if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 && rect.height <= 0) return false;
+
+    const winH = window.innerHeight || document.documentElement?.clientHeight || 0;
+    const winW = window.innerWidth || document.documentElement?.clientWidth || 0;
+    if (winH > 0 && (rect.bottom <= 0 || rect.top >= winH)) return false;
+    if (winW > 0 && (rect.right <= 0 || rect.left >= winW)) return false;
+
+    if (scrollContainer && scrollContainer.isConnected && typeof scrollContainer.getBoundingClientRect === 'function') {
+      const cRect = scrollContainer.getBoundingClientRect();
+      if (cRect.height > 0 && (rect.bottom <= cRect.top - 24 || rect.top >= cRect.bottom + 24)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isParaVisibleInViewport(p, viewport) {
+    if (!p) return false;
+    const probeEl = (p.origEl && p.origEl.offsetHeight > 0) ? p.origEl : (p.transEl || p.origEl);
+    return isElementInVisibleViewport(probeEl, viewport);
+  }
+
+  function promoteVisibleParagraphTasks() {
+    if (disposed) return;
+    const orderedWrappers = orderItemsVisibleFirstReverse(
+      Array.from(trackedWrappers),
+      w => isElementInVisibleViewport(w, null)
+    ).ordered;
+    const promoted = [];
+    const seenTasks = new Set();
+
+    for (const wrapper of orderedWrappers) {
+      if (!wrapper || !wrapper.isConnected) continue;
+      const st = blockStates.get(wrapper);
+      if (!st || !st.orderedOrigEls.length) continue;
+      const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+      const viewport = getViewportContainer(wrapper, trigger);
+      if (!viewport || !isElementInVisibleViewport(viewport, null)) continue;
+
+      for (let i = st.orderedOrigEls.length - 1; i >= 0; i--) {
+        const p = st.domParas.get(st.orderedOrigEls[i]);
+        if (!p || p.status !== 'queued' || !isParaVisibleInViewport(p, viewport)) continue;
+        const task = activeTasks.get(p.activeTaskKey || p.canonKey);
+        if (!task || task.running || task.done || task.cancelled || task.priority === 'visible' || seenTasks.has(task)) {
+          continue;
+        }
+        const oldQueue = getQueueByPriority(task.priority);
+        const idx = oldQueue.indexOf(task);
+        if (idx !== -1) oldQueue.splice(idx, 1);
+        task.priority = 'visible';
+        seenTasks.add(task);
+        promoted.push(task);
+      }
+    }
+
+    if (promoted.length > 0) {
+      visibleQueue.unshift(...promoted);
+      scheduleBatchFlush(12);
+    }
   }
 
   function scheduleBatchFlush(delayMs) {
@@ -1154,7 +1250,7 @@
   }
 
   function popNextCoalescedBatch() {
-    const orderedQueues = [titleQueue, highQueue, bgQueue];
+    const orderedQueues = [titleQueue, visibleQueue, highQueue, bgQueue];
     for (const queue of orderedQueues) {
       while (queue.length > 0 && (queue[0].done || queue[0].cancelled)) {
         queue.shift();
@@ -1295,8 +1391,8 @@
       activeBatchCount = Math.max(0, activeBatchCount - 1);
       activeTranslations = Math.max(0, activeTranslations - batch.length);
       renderSettingsUI();
-      if (!disposed && (titleQueue.length || highQueue.length || bgQueue.length)) {
-        const nextDelay = titleQueue.length ? 8 : 12;
+      if (!disposed && (titleQueue.length || visibleQueue.length || highQueue.length || bgQueue.length)) {
+        const nextDelay = (titleQueue.length || visibleQueue.length) ? 8 : 12;
         scheduleBatchFlush(nextDelay);
       }
     });
@@ -1307,7 +1403,7 @@
     if (!force && memCache.has(canonKey)) {
       const hit = memCache.get(canonKey);
       subscriber.onDone?.(hit, true);
-      return;
+      return null;
     }
 
     const taskKey = force ? `force:${canonKey}:${++reqSeq}` : canonKey;
@@ -1332,7 +1428,7 @@
       activeTasks.set(taskKey, task);
       getQueueByPriority(priority).push(task);
       scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
-      return;
+      return taskKey;
     }
 
     // Attach to existing inflight/queued task and upgrade priority lane if needed
@@ -1349,6 +1445,7 @@
       if (!newQueue.includes(existing)) newQueue.push(existing);
       scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
     }
+    return existing.taskKey;
   }
 
   async function prewarmBackendCache(items, targetLang, model, opts = {}) {
@@ -1975,12 +2072,13 @@
     return targets;
   }
 
-  function scanStepAndHeaderTitles(targetLang, model, prewarmItems, forceAll = false) {
+  function scanStepAndHeaderTitles(targetLang, model, prewarmItems, forceAll = false, priorityTargetEl = null) {
     for (const [containerEl] of Array.from(titleStates.entries())) {
       if (!containerEl.isConnected) titleStates.delete(containerEl);
     }
 
     const targets = collectTitleTargets();
+    const pendingTitles = [];
     for (const t of targets) {
       const { containerEl, origEl, insertBeforeEl, className, isStepSlot, wrapperSt } = t;
       let entry = titleStates.get(containerEl);
@@ -2097,9 +2195,28 @@
       prewarmItems.push({ text: info.fullText });
 
       if (forceAll || (allowTitleTranslate && entry.status === 'idle')) {
-        startTitleTranslation(entry, targetLang, model, forceAll);
+        pendingTitles.push({
+          entry,
+          isPriorityTarget: Boolean(priorityTargetEl && containerEl === priorityTargetEl)
+        });
       } else {
         syncTitleEntryUI(entry);
+      }
+    }
+
+    if (pendingTitles.length > 0) {
+      const priorityItems = [];
+      const restItems = [];
+      for (const item of pendingTitles) {
+        if (item.isPriorityTarget) priorityItems.push(item);
+        else restItems.push(item);
+      }
+      const orderedRest = orderItemsVisibleFirstReverse(
+        restItems,
+        item => isElementInVisibleViewport(item.entry.containerEl, null)
+      ).ordered;
+      for (const item of priorityItems.concat(orderedRest)) {
+        startTitleTranslation(item.entry, targetLang, model, forceAll);
       }
     }
   }
@@ -2118,7 +2235,7 @@
     renderParaTransEl(p);
     syncWrapperModeAndOrigVisibility(wrapper, st);
 
-    enqueueTranslationTask({
+    p.activeTaskKey = enqueueTranslationTask({
       text: p.text,
       targetLang,
       model,
@@ -2163,19 +2280,24 @@
           syncWrapperModeAndOrigVisibility(wrapper, st);
         }
       }
-    });
+    }) || '';
   }
 
-  function startFiberBlockTranslation(fb, targetLang, model, priority, onStateChange) {
+  function startFiberBlockTranslation(fb, targetLang, model, priority, onStateChange, force = false) {
     const activeCanon = fb.canonKey;
     fb.status = 'queued';
+    if (force) {
+      fb.targetText = '';
+      fb.fromCache = false;
+      fb.error = '';
+    }
     onStateChange?.();
 
     enqueueTranslationTask({
       text: fb.text,
       targetLang,
       model,
-      force: false,
+      force,
       priority,
       subscriber: {
         onStart: () => {
@@ -2215,6 +2337,7 @@
     const model = settings.model || DEFAULT_MODEL;
 
     if (viewport && st.orderedOrigEls.length > 0) {
+      const candidates = [];
       for (const origEl of st.orderedOrigEls) {
         const p = st.domParas.get(origEl);
         if (!p) continue;
@@ -2223,6 +2346,18 @@
           continue;
         }
         if (force || p.status === 'idle' || p.status === 'error') {
+          candidates.push(p);
+        }
+      }
+      if (candidates.length > 0) {
+        const { visible, rest } = orderItemsVisibleFirstReverse(
+          candidates,
+          p => isParaVisibleInViewport(p, viewport)
+        );
+        for (const p of visible) {
+          startDomParaTranslation(wrapper, st, p, targetLang, model, force, 'visible');
+        }
+        for (const p of rest) {
           startDomParaTranslation(wrapper, st, p, targetLang, model, force, 'high');
         }
       }
@@ -2230,7 +2365,8 @@
     }
 
     if (st.fiberBlocks.length > 0) {
-      for (const fb of st.fiberBlocks) {
+      for (let i = st.fiberBlocks.length - 1; i >= 0; i--) {
+        const fb = st.fiberBlocks[i];
         if (!shouldTranslateText(fb.text, targetLang)) {
           fb.status = 'skipped';
           continue;
@@ -2238,13 +2374,13 @@
         if (force || fb.status === 'idle' || fb.status === 'error') {
           startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
             syncWrapperHeaderUI(wrapper, st);
-          });
+          }, force);
         }
       }
     }
   }
 
-  function syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems) {
+  function syncExpandedMarkdownBlocks(wrapper, st, viewport, markdownRoot, streamingNow, targetLang, model, prewarmItems, opts = {}) {
     const allowed = isRegionAllowed(wrapper, st);
     if (!allowed) {
       for (const p of st.domParas.values()) {
@@ -2276,11 +2412,12 @@
     }
 
     st.orderedOrigEls = domBlocks.map(b => b.origEl);
-    const forceAll = st.autoTranslateOnExpand && st.forceTranslateOnExpand;
-    const wantExpandTranslate = st.autoTranslateOnExpand;
+    const forceAll = Boolean(opts.force || (st.autoTranslateOnExpand && st.forceTranslateOnExpand));
+    const wantImmediate = Boolean(opts.manual || st.autoTranslateOnExpand);
     st.autoTranslateOnExpand = false;
     st.forceTranslateOnExpand = false;
 
+    const pendingParas = [];
     for (let i = 0; i < domBlocks.length; i++) {
       const { origEl, text } = domBlocks[i];
       const canonKey = computeCanonicalCacheKey(text, targetLang, model);
@@ -2296,6 +2433,7 @@
           transEl,
           text,
           canonKey,
+          activeTaskKey: '',
           lastGrowthAt: now,
           status: 'idle',
           targetText: '',
@@ -2309,6 +2447,7 @@
       } else if (p.canonKey !== canonKey) {
         p.text = text;
         p.canonKey = canonKey;
+        p.activeTaskKey = '';
         p.lastGrowthAt = now;
         p.status = 'idle';
         p.targetText = '';
@@ -2348,17 +2487,31 @@
       const isTrailingBlock = i === domBlocks.length - 1;
       const autoTrigger = allowed && (!streamingNow || !isTrailingBlock || (now - p.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
 
-      if (forceAll || (wantExpandTranslate && p.status === 'idle') || (autoTrigger && p.status === 'idle')) {
-        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
+      if (forceAll || (wantImmediate && (p.status === 'idle' || p.status === 'error')) || (autoTrigger && p.status === 'idle')) {
+        pendingParas.push(p);
       } else {
         renderParaTransEl(p);
+      }
+    }
+
+    if (pendingParas.length > 0) {
+      const scrollBox = viewport || markdownRoot.closest('.overflow-y-auto');
+      const { visible, rest } = orderItemsVisibleFirstReverse(
+        pendingParas,
+        p => isParaVisibleInViewport(p, scrollBox)
+      );
+      for (const p of visible) {
+        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'visible');
+      }
+      for (const p of rest) {
+        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
       }
     }
 
     syncWrapperModeAndOrigVisibility(wrapper, st);
   }
 
-  function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems) {
+  function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems, opts = {}) {
     const allowed = isRegionAllowed(wrapper, st);
     if (!allowed) {
       st.fiberBlocks = [];
@@ -2366,6 +2519,8 @@
       return;
     }
 
+    const forceAll = Boolean(opts.force);
+    const wantManual = Boolean(opts.manual);
     const rawBlocks = splitMarkdownIntoBlocks(fiberThinking).filter(b => b.type === 'prose');
     const now = Date.now();
     const prevByCanon = new Map();
@@ -2374,6 +2529,7 @@
     }
 
     const nextBlocks = [];
+    const pendingFiber = [];
     for (let i = 0; i < rawBlocks.length; i++) {
       const text = rawBlocks[i].text;
       const canonKey = computeCanonicalCacheKey(text, targetLang, model);
@@ -2396,7 +2552,7 @@
         continue;
       }
 
-      if (memCache.has(canonKey)) {
+      if (!forceAll && memCache.has(canonKey)) {
         fb.status = 'done';
         fb.targetText = memCache.get(canonKey);
         fb.fromCache = true;
@@ -2409,24 +2565,31 @@
 
       const isTrailing = i === rawBlocks.length - 1;
       const manualScope = Boolean(st.manualActivated || wrapper.closest('[data-ag-tt-manual-group="1"]'));
-      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation || manualScope);
-      const eligibleRecency = isRecentOrLive || manualScope;
+      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation || manualScope || wantManual);
+      const eligibleRecency = isRecentOrLive || manualScope || wantManual;
       const canBgTranslate = allowed && allowCollapsedBg && eligibleRecency && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
-      if (canBgTranslate && fb.status === 'idle') {
-        startFiberBlockTranslation(fb, targetLang, model, manualScope ? 'high' : 'bg', () => {
-          syncWrapperHeaderUI(wrapper, st);
-        });
+      if (forceAll || (wantManual && (fb.status === 'idle' || fb.status === 'error')) || ((canBgTranslate || wantManual) && fb.status === 'idle')) {
+        pendingFiber.push({ fb, priority: (manualScope || wantManual) ? 'high' : 'bg' });
       }
       nextBlocks.push(fb);
     }
 
     st.fiberBlocks = nextBlocks;
+    for (let i = pendingFiber.length - 1; i >= 0; i--) {
+      const item = pendingFiber[i];
+      startFiberBlockTranslation(item.fb, targetLang, model, item.priority, () => {
+        syncWrapperHeaderUI(wrapper, st);
+      }, forceAll);
+    }
     syncWrapperHeaderUI(wrapper, st);
   }
 
   function scanCollapsedToolGroups(targetLang, model, prewarmItems) {
     if (!settings.enabled) return;
-    const buttons = document.querySelectorAll('button[data-testid="tool-group-collapsible"]');
+    const buttons = orderItemsVisibleFirstReverse(
+      Array.from(document.querySelectorAll('button[data-testid="tool-group-collapsible"]')),
+      btn => isElementInVisibleViewport(btn, null)
+    ).ordered;
     for (const btn of buttons) {
       const isExpanded = btn.getAttribute('aria-expanded') === 'true';
       if (isExpanded) continue;
@@ -2469,6 +2632,7 @@
       const stateList = toolGroupStates.get(btn) || [];
       const prevMap = new Map(stateList.map(item => [item.canonKey, item]));
       const nextList = [];
+      const pendingToolFiber = [];
 
       for (const th of thinkings) {
         const blocks = splitMarkdownIntoBlocks(th).filter(b => b.type === 'prose');
@@ -2482,12 +2646,15 @@
             entry = { text: blk.text, canonKey, status: 'idle', targetText: '', fromCache: false, error: '' };
           }
           if (settings.enabled && settings.pretranslateCollapsed && entry.status === 'idle') {
-            startFiberBlockTranslation(entry, targetLang, model, 'bg', null);
+            pendingToolFiber.push(entry);
           }
           nextList.push(entry);
         }
       }
       toolGroupStates.set(btn, nextList);
+      for (let i = pendingToolFiber.length - 1; i >= 0; i--) {
+        startFiberBlockTranslation(pendingToolFiber[i], targetLang, model, 'bg', null, false);
+      }
     }
   }
 
@@ -2710,17 +2877,16 @@
         if (disposed || !wrapper.isConnected) return;
       }
 
-      scanStepAndHeaderTitles(targetLang, model, [], false);
+      const snap = captureQueueSnapshot();
+      scanStepAndHeaderTitles(targetLang, model, [], force, targetBtn);
       const viewportNow = getViewportContainer(wrapper, targetBtn);
       const markdownRootNow = viewportNow ? findMarkdownRoot(viewportNow) : null;
       if (markdownRootNow) {
-        syncExpandedMarkdownBlocks(wrapper, st, markdownRootNow, isTriggerStreaming(targetBtn), targetLang, model, []);
-        translateWrapperNow(wrapper, force);
+        syncExpandedMarkdownBlocks(wrapper, st, viewportNow, markdownRootNow, isTriggerStreaming(targetBtn), targetLang, model, [], { force, manual: true });
       } else {
         const fiberThinking = extractThinkingFromFiber(targetBtn);
         if (fiberThinking) {
-          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, isTriggerStreaming(targetBtn), true, targetLang, model, []);
-          translateWrapperNow(wrapper, force);
+          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, isTriggerStreaming(targetBtn), true, targetLang, model, [], { force, manual: true });
         } else {
           st.autoTranslateOnExpand = true;
           st.forceTranslateOnExpand = force;
@@ -2728,6 +2894,8 @@
           targetBtn.click();
         }
       }
+      promoteNewQueueTasksToFront(snap);
+      flushSchedulerBatches();
       return;
     }
 
@@ -2811,31 +2979,38 @@
     }
     grpState.fiberBlocks = nextGroupFiberBlocks;
 
-    scanStepAndHeaderTitles(targetLang, model, [], force);
+    const snap = captureQueueSnapshot();
+    scanStepAndHeaderTitles(targetLang, model, [], force, targetBtn);
 
-    for (const trig of innerTriggers) {
+    const orderedInnerTriggers = orderItemsVisibleFirstReverse(
+      innerTriggers,
+      trig => isElementInVisibleViewport(trig.parentElement || trig, null)
+    ).ordered;
+    for (const trig of orderedInnerTriggers) {
       const w = trig.parentElement;
       if (!w || !w.isConnected) continue;
       const st = getOrInitBlockState(w);
       const vp = getViewportContainer(w, trig);
       const mdRoot = vp ? findMarkdownRoot(vp) : null;
       if (mdRoot) {
-        syncExpandedMarkdownBlocks(w, st, mdRoot, isTriggerStreaming(trig), targetLang, model, []);
+        syncExpandedMarkdownBlocks(w, st, vp, mdRoot, isTriggerStreaming(trig), targetLang, model, [], { force, manual: true });
       } else {
         const ft = extractThinkingFromFiber(trig);
-        if (ft) syncCollapsedFiberBlocks(w, st, ft, isTriggerStreaming(trig), true, targetLang, model, []);
+        if (ft) syncCollapsedFiberBlocks(w, st, ft, isTriggerStreaming(trig), true, targetLang, model, [], { force, manual: true });
       }
-      translateWrapperNow(w, force);
     }
 
     syncManualGroupBar(groupWrapper, grpState);
-    for (const fb of grpState.fiberBlocks) {
+    for (let i = grpState.fiberBlocks.length - 1; i >= 0; i--) {
+      const fb = grpState.fiberBlocks[i];
       if (force || fb.status === 'idle' || fb.status === 'error') {
         startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
           syncManualGroupBar(groupWrapper, grpState);
-        });
+        }, force);
       }
     }
+    promoteNewQueueTasksToFront(snap);
+    flushSchedulerBatches();
   }
 
   function scanThinkingBlocks() {
@@ -2853,12 +3028,18 @@
 
     const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
     const total = triggers.length;
-
+    const triggerEntries = [];
     for (let idx = 0; idx < total; idx++) {
       const trigger = triggers[idx];
       const wrapper = trigger.parentElement;
-      if (!wrapper) continue;
+      if (wrapper) triggerEntries.push({ trigger, wrapper, idx });
+    }
+    const orderedTriggers = orderItemsVisibleFirstReverse(
+      triggerEntries,
+      item => isElementInVisibleViewport(item.wrapper, null)
+    ).ordered;
 
+    for (const { trigger, wrapper, idx } of orderedTriggers) {
       const isNew = !blockStates.has(wrapper);
       const st = getOrInitBlockState(wrapper);
       if (isNew && !initialScanDone) {
@@ -2874,7 +3055,7 @@
 
       if (markdownRoot) {
         st.fiberBlocks = [];
-        syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems);
+        syncExpandedMarkdownBlocks(wrapper, st, viewport, markdownRoot, streamingNow, targetLang, model, prewarmItems);
       } else {
         // Clear stale DOM maps if collapsed
         if (st.domParas.size > 0) {
@@ -3101,6 +3282,16 @@
     document.addEventListener('mouseover', docMouseOverHandler, true);
     document.addEventListener('mouseout', docMouseOutHandler, true);
 
+    docScrollHandler = () => {
+      if (disposed || scrollPromoteTimer) return;
+      if (!highQueue.length && !bgQueue.length) return;
+      scrollPromoteTimer = setTimeout(() => {
+        scrollPromoteTimer = 0;
+        if (!disposed) promoteVisibleParagraphTasks();
+      }, 100);
+    };
+    document.addEventListener('scroll', docScrollHandler, { capture: true, passive: true });
+
     el('tt-translate-now')?.addEventListener('click', () => {
       const targetLang = getEffectiveTargetLang(settings);
       const model = settings.model || DEFAULT_MODEL;
@@ -3126,7 +3317,11 @@
       }
       scanStepAndHeaderTitles(targetLang, model, [], true);
       scanThinkingBlocks();
-      for (const wrapper of Array.from(trackedWrappers)) {
+      const orderedWrappers = orderItemsVisibleFirstReverse(
+        Array.from(trackedWrappers),
+        w => isElementInVisibleViewport(w, null)
+      ).ordered;
+      for (const wrapper of orderedWrappers) {
         if (!wrapper.isConnected) continue;
         void translateWrapperNow(wrapper, false);
       }
@@ -3218,8 +3413,10 @@
     if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
     if (batchFlushTimer) clearTimeout(batchFlushTimer);
+    if (scrollPromoteTimer) clearTimeout(scrollPromoteTimer);
     if (rafId) cancelAnimationFrame(rafId);
     titleQueue.length = 0;
+    visibleQueue.length = 0;
     highQueue.length = 0;
     bgQueue.length = 0;
     try { themeObserver?.disconnect(); } catch {}
@@ -3228,6 +3425,7 @@
     if (docClickHandler) document.removeEventListener('click', docClickHandler);
     if (docMouseOverHandler) document.removeEventListener('mouseover', docMouseOverHandler, true);
     if (docMouseOutHandler) document.removeEventListener('mouseout', docMouseOutHandler, true);
+    if (docScrollHandler) document.removeEventListener('scroll', docScrollHandler, { capture: true });
     window.removeEventListener('resize', positionPopover);
 
     for (const gw of Array.from(trackedManualGroups)) {
@@ -3307,7 +3505,11 @@
       const targetLang = getEffectiveTargetLang(settings);
       const model = settings.model || DEFAULT_MODEL;
       scanStepAndHeaderTitles(targetLang, model, [], false);
-      for (const w of Array.from(trackedWrappers)) {
+      const orderedWrappers = orderItemsVisibleFirstReverse(
+        Array.from(trackedWrappers),
+        w => isElementInVisibleViewport(w, null)
+      ).ordered;
+      for (const w of orderedWrappers) {
         if (w.isConnected) void translateWrapperNow(w, false);
       }
     }

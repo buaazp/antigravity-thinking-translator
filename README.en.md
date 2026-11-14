@@ -19,8 +19,9 @@ In Google Antigravity 2.x, reasoning models emit their internal `Thinking` strea
 - **Zero-footprint disabled mode & hover-dwell regional manual translate (v0.4.0)**:
   - Turning off the primary **`自动翻译思考过程`** toggle restores the chat UI to **100% vanilla Antigravity**: no translated titles, no right-side translation status pills, and no translation boxes injected into expanded thinking details.
   - Hovering and dwelling (`~0.4s`) over any collapsible thinking/group header (`Thinking`, `Thought for Xs`, `Worked for ...`, `Explored ...`) reveals a subtle floating **`翻译`** button on the right; clicking it manually translates **both the titles and thinking details inside that region** while leaving all other regions untouched.
-- **Customizable Morandi color themes (v0.4.0)**:
-  - Replaces fixed accents with configurable Morandi palettes (Light & Dark tuned) across titles, translation blocks, streaming carets, badges, and settings controls — defaulting to **Celadon Teal (`青绿`)** alongside **Sage (`豆绿`)**, **Mist Blue (`雾蓝`)**, **Dusty Rose (`烟粉`)**, **Taro Mauve (`灰紫`)**, and **Warm Ochre (`暖咖`)**.
+  - **Viewport-first & back-to-front ordering (v0.4.1)**: When translating multi-step or multi-paragraph blocks (which open scrolled to the bottom), currently visible items in the viewport are translated first, followed by remaining items in reverse order (and scrolling up dynamically promotes newly visible queued items).
+- **Customizable Morandi color themes (v0.4.0+)**:
+  - Replaces fixed accents with configurable Morandi palettes (Light & Dark tuned) across titles, translation blocks, streaming carets, badges, and settings controls — defaulting to **Celadon Green (`青瓷绿`)** alongside **Sage Green (`豆沙绿`)**, **Foggy Blue (`雾霾蓝`)**, **Dusty Rose (`烟灰粉`)**, **Dusty Mauve (`香芋紫`)**, and **Warm Taupe (`暖灰咖`)**.
 - **Two display modes & multi-language support**:
   - **Bilingual (`显示原文和译文`)**: Shows each translated paragraph and title inline alongside its English source.
   - **Translation Only (`只显示译文`)**: Swaps each English paragraph (and non-interactive title) out cleanly once its translation begins streaming, with per-block buttons to toggle back to bilingual view, re-translate, or copy.

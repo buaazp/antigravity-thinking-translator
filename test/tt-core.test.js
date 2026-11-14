@@ -38,10 +38,12 @@ test('normalizeSettings preserves defaults and supports custom language, modes &
   assert.equal(core.getEffectiveTargetLang(directForeign), 'Svenska');
 });
 
-test('Morandi color themes default to celadon and expose distinct light/dark tokens', () => {
+test('Morandi color themes default to celadon and expose standard names & light/dark tokens', () => {
   assert.equal(core.DEFAULT_COLOR_THEME, 'celadon');
   const ids = core.COLOR_THEMES.map(item => item.id);
+  const labels = core.COLOR_THEMES.map(item => item.label);
   assert.deepEqual(ids, ['celadon', 'sage', 'mist_blue', 'dusty_rose', 'taro_mauve', 'warm_ochre']);
+  assert.deepEqual(labels, ['青瓷绿', '豆沙绿', '雾霾蓝', '烟灰粉', '香芋紫', '暖灰咖']);
 
   for (const id of ids) {
     const light = core.getColorThemeTokens(id, false);
@@ -272,4 +274,28 @@ test('buildTranslationPrompt supports compact warm-worker mode and batch prompt/
   // Single-item batch tolerates markerless model response
   const singleFallback = core.parseBatchTranslationStream('唯一条目译文', 1, ['Only item'], true);
   assert.deepEqual(singleFallback.completed, { 0: '唯一条目译文' });
+});
+
+test('orderItemsVisibleFirstReverse prioritizes visible items then remaining items from back to front', () => {
+  const items = Array.from({ length: 41 }, (_, i) => i);
+
+  // Scrolled to bottom: items 38, 39, 40 are visible in viewport
+  const bottomVisible = core.orderItemsVisibleFirstReverse(items, n => n >= 38);
+  assert.deepEqual(bottomVisible.visible, [40, 39, 38]);
+  assert.equal(bottomVisible.rest.length, 38);
+  assert.deepEqual(bottomVisible.rest.slice(0, 3), [37, 36, 35]);
+  assert.equal(bottomVisible.rest[bottomVisible.rest.length - 1], 0);
+  assert.deepEqual(bottomVisible.ordered.slice(0, 5), [40, 39, 38, 37, 36]);
+
+  // Scrolled to middle: items 18, 19, 20 are visible right now
+  const midVisible = core.orderItemsVisibleFirstReverse(items, n => n >= 18 && n <= 20);
+  assert.deepEqual(midVisible.visible, [20, 19, 18]);
+  assert.deepEqual(midVisible.rest.slice(0, 3), [40, 39, 38]);
+  assert.deepEqual(midVisible.ordered.slice(0, 6), [20, 19, 18, 40, 39, 38]);
+
+  // Collapsed or completely off-screen: pure reverse order (9 -> 0)
+  const ten = Array.from({ length: 10 }, (_, i) => i);
+  const allOffscreen = core.orderItemsVisibleFirstReverse(ten, () => false);
+  assert.deepEqual(allOffscreen.visible, []);
+  assert.deepEqual(allOffscreen.ordered, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
 });

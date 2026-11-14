@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.4.0';
+  const PLUGIN_VERSION = '0.4.1';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';
@@ -19,8 +19,8 @@
   const COLOR_THEMES = [
     {
       id: 'celadon',
-      label: '青绿',
-      title: '莫兰迪青绿 (默认)',
+      label: '青瓷绿',
+      title: '青瓷绿 · Celadon Green (默认)',
       swatch: '#4d948d',
       light: {
         accent: '#438780',
@@ -45,8 +45,8 @@
     },
     {
       id: 'sage',
-      label: '豆绿',
-      title: '莫兰迪豆绿',
+      label: '豆沙绿',
+      title: '豆沙绿 · Sage Green',
       swatch: '#688f74',
       light: {
         accent: '#5c8368',
@@ -71,8 +71,8 @@
     },
     {
       id: 'mist_blue',
-      label: '雾蓝',
-      title: '莫兰迪雾霾蓝',
+      label: '雾霾蓝',
+      title: '雾霾蓝 · Foggy Blue',
       swatch: '#5d829c',
       light: {
         accent: '#527792',
@@ -97,8 +97,8 @@
     },
     {
       id: 'dusty_rose',
-      label: '烟粉',
-      title: '莫兰迪烟灰粉',
+      label: '烟灰粉',
+      title: '烟灰粉 · Dusty Rose',
       swatch: '#a86f7b',
       light: {
         accent: '#9c6370',
@@ -123,8 +123,8 @@
     },
     {
       id: 'taro_mauve',
-      label: '灰紫',
-      title: '莫兰迪香芋灰紫',
+      label: '香芋紫',
+      title: '香芋紫 · Dusty Mauve',
       swatch: '#807399',
       light: {
         accent: '#75688f',
@@ -149,8 +149,8 @@
     },
     {
       id: 'warm_ochre',
-      label: '暖咖',
-      title: '莫兰迪燕麦暖咖',
+      label: '暖灰咖',
+      title: '暖灰咖 · Warm Taupe',
       swatch: '#9b7c5e',
       light: {
         accent: '#8f7053',
@@ -1198,6 +1198,22 @@
     return headHtml + injectCaretBeforeLastClose(renderSafeMarkdownHtml(activePara));
   }
 
+  function orderItemsVisibleFirstReverse(items, isVisibleFn) {
+    const list = Array.isArray(items) ? items : [];
+    const checkVisible = typeof isVisibleFn === 'function' ? isVisibleFn : () => false;
+    const visible = [];
+    const rest = [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const item = list[i];
+      if (checkVisible(item, i)) {
+        visible.push(item);
+      } else {
+        rest.push(item);
+      }
+    }
+    return { visible, rest, ordered: visible.concat(rest) };
+  }
+
   return {
     PLUGIN_VERSION,
     DEFAULT_MODEL,
@@ -1229,6 +1245,7 @@
     parseAgyModelsOutput,
     escapeHtml,
     renderSafeMarkdownHtml,
-    renderStreamingMarkdownHtml
+    renderStreamingMarkdownHtml,
+    orderItemsVisibleFirstReverse
   };
 });

@@ -31,7 +31,8 @@
     translateBoilerplateTitle,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
-    escapeHtml
+    escapeHtml,
+    orderItemsVisibleFirstReverse
   } = core;
 
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
@@ -62,6 +63,7 @@
   let pollTimer = 0;
   let batchFlushTimer = 0;
   let batchFlushAt = 0;
+  let scrollPromoteTimer = 0;
   let rafId = 0;
   let lastAnimTick = 0;
   let hoverDwellTimer = 0;
@@ -76,6 +78,7 @@
   let docClickHandler = null;
   let docMouseOverHandler = null;
   let docMouseOutHandler = null;
+  let docScrollHandler = null;
   let reqSeq = 0;
   let initialScanDone = false;
 
@@ -93,15 +96,16 @@
   const memCache = new Map();
   const checkedCanonMisses = new Set();
 
-  // 3-tier coalescing batch scheduler: Priority 0 titles > Priority 1 expanded/live prose > Priority 2 bg prose
+  // 4-tier coalescing batch scheduler: Priority 0 titles > Priority 1 visible prose > Priority 2 high offscreen prose > Priority 3 bg prose
   let activeBatchCount = 0;
   const titleQueue = [];
+  const visibleQueue = [];
   const highQueue = [];
   const bgQueue = [];
   const activeTasks = new Map(); // taskKey -> Task
 
-  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #438780;\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\n  --tt-accent-text: #2f6f68;\n  --tt-success: #438780;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #6ab0a8;\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\n  --tt-accent-text: #8ccac2;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-accent);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n  transition: opacity 140ms ease;\n}\n\n.tt-row-sub[data-disabled=\"true\"] {\n  opacity: 0.46;\n  pointer-events: none;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-swatches {\n  display: grid;\n  grid-template-columns: repeat(6, minmax(0, 1fr));\n  gap: 4px;\n}\n\n.tt-swatch-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 3px;\n  min-width: 0;\n  padding: 5px 3px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text-muted);\n  font-size: 10.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n\n.tt-swatch-btn:hover {\n  border-color: var(--tt-accent);\n  color: var(--tt-text);\n}\n\n.tt-swatch-btn[data-active=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-swatch-dot {\n  width: 7px;\n  height: 7px;\n  border-radius: 50%;\n  flex-shrink: 0;\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.0</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
+  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #438780;\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\n  --tt-accent-text: #2f6f68;\n  --tt-success: #438780;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #6ab0a8;\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\n  --tt-accent-text: #8ccac2;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-accent);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n  transition: opacity 140ms ease;\n}\n\n.tt-row-sub[data-disabled=\"true\"] {\n  opacity: 0.46;\n  pointer-events: none;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-swatches {\n  display: grid;\n  grid-template-columns: repeat(3, minmax(0, 1fr));\n  gap: 6px;\n}\n\n.tt-swatch-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  min-width: 0;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text-muted);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n\n.tt-swatch-btn:hover {\n  border-color: var(--tt-accent);\n  color: var(--tt-text);\n}\n\n.tt-swatch-btn[data-active=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-swatch-dot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  flex-shrink: 0;\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.1</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -819,7 +823,11 @@
       batchFlushTimer = 0;
       batchFlushAt = 0;
     }
-    for (const q of [titleQueue, highQueue, bgQueue]) {
+    if (scrollPromoteTimer) {
+      clearTimeout(scrollPromoteTimer);
+      scrollPromoteTimer = 0;
+    }
+    for (const q of [titleQueue, visibleQueue, highQueue, bgQueue]) {
       while (q.length) {
         const task = q.shift();
         if (task && !task.running) {
@@ -1127,14 +1135,102 @@
   }
 
   // =========================================================================
-  // 3-Tier Coalescing Batch Scheduler (Priority 0 Titles > Expanded > Bg)
+  // 4-Tier Coalescing Batch Scheduler (Titles > Visible > High Offscreen > Bg)
   // =========================================================================
-  const PRIORITY_RANK = { title: 0, high: 1, bg: 2 };
+  const PRIORITY_RANK = { title: 0, visible: 1, high: 2, bg: 3 };
 
   function getQueueByPriority(priority) {
     if (priority === 'title') return titleQueue;
+    if (priority === 'visible') return visibleQueue;
     if (priority === 'high') return highQueue;
     return bgQueue;
+  }
+
+  function captureQueueSnapshot() {
+    return {
+      title: titleQueue.length,
+      visible: visibleQueue.length,
+      high: highQueue.length
+    };
+  }
+
+  function promoteNewQueueTasksToFront(snap) {
+    if (!snap) return;
+    const pairs = [
+      [titleQueue, snap.title],
+      [visibleQueue, snap.visible],
+      [highQueue, snap.high]
+    ];
+    for (const [q, prevLen] of pairs) {
+      if (prevLen > 0 && q.length > prevLen) {
+        const added = q.splice(prevLen);
+        q.unshift(...added);
+      }
+    }
+  }
+
+  function isElementInVisibleViewport(el, scrollContainer = null) {
+    if (!el || !el.isConnected || typeof el.getBoundingClientRect !== 'function') return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 && rect.height <= 0) return false;
+
+    const winH = window.innerHeight || document.documentElement?.clientHeight || 0;
+    const winW = window.innerWidth || document.documentElement?.clientWidth || 0;
+    if (winH > 0 && (rect.bottom <= 0 || rect.top >= winH)) return false;
+    if (winW > 0 && (rect.right <= 0 || rect.left >= winW)) return false;
+
+    if (scrollContainer && scrollContainer.isConnected && typeof scrollContainer.getBoundingClientRect === 'function') {
+      const cRect = scrollContainer.getBoundingClientRect();
+      if (cRect.height > 0 && (rect.bottom <= cRect.top - 24 || rect.top >= cRect.bottom + 24)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isParaVisibleInViewport(p, viewport) {
+    if (!p) return false;
+    const probeEl = (p.origEl && p.origEl.offsetHeight > 0) ? p.origEl : (p.transEl || p.origEl);
+    return isElementInVisibleViewport(probeEl, viewport);
+  }
+
+  function promoteVisibleParagraphTasks() {
+    if (disposed) return;
+    const orderedWrappers = orderItemsVisibleFirstReverse(
+      Array.from(trackedWrappers),
+      w => isElementInVisibleViewport(w, null)
+    ).ordered;
+    const promoted = [];
+    const seenTasks = new Set();
+
+    for (const wrapper of orderedWrappers) {
+      if (!wrapper || !wrapper.isConnected) continue;
+      const st = blockStates.get(wrapper);
+      if (!st || !st.orderedOrigEls.length) continue;
+      const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+      const viewport = getViewportContainer(wrapper, trigger);
+      if (!viewport || !isElementInVisibleViewport(viewport, null)) continue;
+
+      for (let i = st.orderedOrigEls.length - 1; i >= 0; i--) {
+        const p = st.domParas.get(st.orderedOrigEls[i]);
+        if (!p || p.status !== 'queued' || !isParaVisibleInViewport(p, viewport)) continue;
+        const task = activeTasks.get(p.activeTaskKey || p.canonKey);
+        if (!task || task.running || task.done || task.cancelled || task.priority === 'visible' || seenTasks.has(task)) {
+          continue;
+        }
+        const oldQueue = getQueueByPriority(task.priority);
+        const idx = oldQueue.indexOf(task);
+        if (idx !== -1) oldQueue.splice(idx, 1);
+        task.priority = 'visible';
+        seenTasks.add(task);
+        promoted.push(task);
+      }
+    }
+
+    if (promoted.length > 0) {
+      visibleQueue.unshift(...promoted);
+      scheduleBatchFlush(12);
+    }
   }
 
   function scheduleBatchFlush(delayMs) {
@@ -1155,7 +1251,7 @@
   }
 
   function popNextCoalescedBatch() {
-    const orderedQueues = [titleQueue, highQueue, bgQueue];
+    const orderedQueues = [titleQueue, visibleQueue, highQueue, bgQueue];
     for (const queue of orderedQueues) {
       while (queue.length > 0 && (queue[0].done || queue[0].cancelled)) {
         queue.shift();
@@ -1296,8 +1392,8 @@
       activeBatchCount = Math.max(0, activeBatchCount - 1);
       activeTranslations = Math.max(0, activeTranslations - batch.length);
       renderSettingsUI();
-      if (!disposed && (titleQueue.length || highQueue.length || bgQueue.length)) {
-        const nextDelay = titleQueue.length ? 8 : 12;
+      if (!disposed && (titleQueue.length || visibleQueue.length || highQueue.length || bgQueue.length)) {
+        const nextDelay = (titleQueue.length || visibleQueue.length) ? 8 : 12;
         scheduleBatchFlush(nextDelay);
       }
     });
@@ -1308,7 +1404,7 @@
     if (!force && memCache.has(canonKey)) {
       const hit = memCache.get(canonKey);
       subscriber.onDone?.(hit, true);
-      return;
+      return null;
     }
 
     const taskKey = force ? `force:${canonKey}:${++reqSeq}` : canonKey;
@@ -1333,7 +1429,7 @@
       activeTasks.set(taskKey, task);
       getQueueByPriority(priority).push(task);
       scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
-      return;
+      return taskKey;
     }
 
     // Attach to existing inflight/queued task and upgrade priority lane if needed
@@ -1350,6 +1446,7 @@
       if (!newQueue.includes(existing)) newQueue.push(existing);
       scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
     }
+    return existing.taskKey;
   }
 
   async function prewarmBackendCache(items, targetLang, model, opts = {}) {
@@ -1976,12 +2073,13 @@
     return targets;
   }
 
-  function scanStepAndHeaderTitles(targetLang, model, prewarmItems, forceAll = false) {
+  function scanStepAndHeaderTitles(targetLang, model, prewarmItems, forceAll = false, priorityTargetEl = null) {
     for (const [containerEl] of Array.from(titleStates.entries())) {
       if (!containerEl.isConnected) titleStates.delete(containerEl);
     }
 
     const targets = collectTitleTargets();
+    const pendingTitles = [];
     for (const t of targets) {
       const { containerEl, origEl, insertBeforeEl, className, isStepSlot, wrapperSt } = t;
       let entry = titleStates.get(containerEl);
@@ -2098,9 +2196,28 @@
       prewarmItems.push({ text: info.fullText });
 
       if (forceAll || (allowTitleTranslate && entry.status === 'idle')) {
-        startTitleTranslation(entry, targetLang, model, forceAll);
+        pendingTitles.push({
+          entry,
+          isPriorityTarget: Boolean(priorityTargetEl && containerEl === priorityTargetEl)
+        });
       } else {
         syncTitleEntryUI(entry);
+      }
+    }
+
+    if (pendingTitles.length > 0) {
+      const priorityItems = [];
+      const restItems = [];
+      for (const item of pendingTitles) {
+        if (item.isPriorityTarget) priorityItems.push(item);
+        else restItems.push(item);
+      }
+      const orderedRest = orderItemsVisibleFirstReverse(
+        restItems,
+        item => isElementInVisibleViewport(item.entry.containerEl, null)
+      ).ordered;
+      for (const item of priorityItems.concat(orderedRest)) {
+        startTitleTranslation(item.entry, targetLang, model, forceAll);
       }
     }
   }
@@ -2119,7 +2236,7 @@
     renderParaTransEl(p);
     syncWrapperModeAndOrigVisibility(wrapper, st);
 
-    enqueueTranslationTask({
+    p.activeTaskKey = enqueueTranslationTask({
       text: p.text,
       targetLang,
       model,
@@ -2164,19 +2281,24 @@
           syncWrapperModeAndOrigVisibility(wrapper, st);
         }
       }
-    });
+    }) || '';
   }
 
-  function startFiberBlockTranslation(fb, targetLang, model, priority, onStateChange) {
+  function startFiberBlockTranslation(fb, targetLang, model, priority, onStateChange, force = false) {
     const activeCanon = fb.canonKey;
     fb.status = 'queued';
+    if (force) {
+      fb.targetText = '';
+      fb.fromCache = false;
+      fb.error = '';
+    }
     onStateChange?.();
 
     enqueueTranslationTask({
       text: fb.text,
       targetLang,
       model,
-      force: false,
+      force,
       priority,
       subscriber: {
         onStart: () => {
@@ -2216,6 +2338,7 @@
     const model = settings.model || DEFAULT_MODEL;
 
     if (viewport && st.orderedOrigEls.length > 0) {
+      const candidates = [];
       for (const origEl of st.orderedOrigEls) {
         const p = st.domParas.get(origEl);
         if (!p) continue;
@@ -2224,6 +2347,18 @@
           continue;
         }
         if (force || p.status === 'idle' || p.status === 'error') {
+          candidates.push(p);
+        }
+      }
+      if (candidates.length > 0) {
+        const { visible, rest } = orderItemsVisibleFirstReverse(
+          candidates,
+          p => isParaVisibleInViewport(p, viewport)
+        );
+        for (const p of visible) {
+          startDomParaTranslation(wrapper, st, p, targetLang, model, force, 'visible');
+        }
+        for (const p of rest) {
           startDomParaTranslation(wrapper, st, p, targetLang, model, force, 'high');
         }
       }
@@ -2231,7 +2366,8 @@
     }
 
     if (st.fiberBlocks.length > 0) {
-      for (const fb of st.fiberBlocks) {
+      for (let i = st.fiberBlocks.length - 1; i >= 0; i--) {
+        const fb = st.fiberBlocks[i];
         if (!shouldTranslateText(fb.text, targetLang)) {
           fb.status = 'skipped';
           continue;
@@ -2239,13 +2375,13 @@
         if (force || fb.status === 'idle' || fb.status === 'error') {
           startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
             syncWrapperHeaderUI(wrapper, st);
-          });
+          }, force);
         }
       }
     }
   }
 
-  function syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems) {
+  function syncExpandedMarkdownBlocks(wrapper, st, viewport, markdownRoot, streamingNow, targetLang, model, prewarmItems, opts = {}) {
     const allowed = isRegionAllowed(wrapper, st);
     if (!allowed) {
       for (const p of st.domParas.values()) {
@@ -2277,11 +2413,12 @@
     }
 
     st.orderedOrigEls = domBlocks.map(b => b.origEl);
-    const forceAll = st.autoTranslateOnExpand && st.forceTranslateOnExpand;
-    const wantExpandTranslate = st.autoTranslateOnExpand;
+    const forceAll = Boolean(opts.force || (st.autoTranslateOnExpand && st.forceTranslateOnExpand));
+    const wantImmediate = Boolean(opts.manual || st.autoTranslateOnExpand);
     st.autoTranslateOnExpand = false;
     st.forceTranslateOnExpand = false;
 
+    const pendingParas = [];
     for (let i = 0; i < domBlocks.length; i++) {
       const { origEl, text } = domBlocks[i];
       const canonKey = computeCanonicalCacheKey(text, targetLang, model);
@@ -2297,6 +2434,7 @@
           transEl,
           text,
           canonKey,
+          activeTaskKey: '',
           lastGrowthAt: now,
           status: 'idle',
           targetText: '',
@@ -2310,6 +2448,7 @@
       } else if (p.canonKey !== canonKey) {
         p.text = text;
         p.canonKey = canonKey;
+        p.activeTaskKey = '';
         p.lastGrowthAt = now;
         p.status = 'idle';
         p.targetText = '';
@@ -2349,17 +2488,31 @@
       const isTrailingBlock = i === domBlocks.length - 1;
       const autoTrigger = allowed && (!streamingNow || !isTrailingBlock || (now - p.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
 
-      if (forceAll || (wantExpandTranslate && p.status === 'idle') || (autoTrigger && p.status === 'idle')) {
-        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
+      if (forceAll || (wantImmediate && (p.status === 'idle' || p.status === 'error')) || (autoTrigger && p.status === 'idle')) {
+        pendingParas.push(p);
       } else {
         renderParaTransEl(p);
+      }
+    }
+
+    if (pendingParas.length > 0) {
+      const scrollBox = viewport || markdownRoot.closest('.overflow-y-auto');
+      const { visible, rest } = orderItemsVisibleFirstReverse(
+        pendingParas,
+        p => isParaVisibleInViewport(p, scrollBox)
+      );
+      for (const p of visible) {
+        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'visible');
+      }
+      for (const p of rest) {
+        startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
       }
     }
 
     syncWrapperModeAndOrigVisibility(wrapper, st);
   }
 
-  function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems) {
+  function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems, opts = {}) {
     const allowed = isRegionAllowed(wrapper, st);
     if (!allowed) {
       st.fiberBlocks = [];
@@ -2367,6 +2520,8 @@
       return;
     }
 
+    const forceAll = Boolean(opts.force);
+    const wantManual = Boolean(opts.manual);
     const rawBlocks = splitMarkdownIntoBlocks(fiberThinking).filter(b => b.type === 'prose');
     const now = Date.now();
     const prevByCanon = new Map();
@@ -2375,6 +2530,7 @@
     }
 
     const nextBlocks = [];
+    const pendingFiber = [];
     for (let i = 0; i < rawBlocks.length; i++) {
       const text = rawBlocks[i].text;
       const canonKey = computeCanonicalCacheKey(text, targetLang, model);
@@ -2397,7 +2553,7 @@
         continue;
       }
 
-      if (memCache.has(canonKey)) {
+      if (!forceAll && memCache.has(canonKey)) {
         fb.status = 'done';
         fb.targetText = memCache.get(canonKey);
         fb.fromCache = true;
@@ -2410,24 +2566,31 @@
 
       const isTrailing = i === rawBlocks.length - 1;
       const manualScope = Boolean(st.manualActivated || wrapper.closest('[data-ag-tt-manual-group="1"]'));
-      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation || manualScope);
-      const eligibleRecency = isRecentOrLive || manualScope;
+      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation || manualScope || wantManual);
+      const eligibleRecency = isRecentOrLive || manualScope || wantManual;
       const canBgTranslate = allowed && allowCollapsedBg && eligibleRecency && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
-      if (canBgTranslate && fb.status === 'idle') {
-        startFiberBlockTranslation(fb, targetLang, model, manualScope ? 'high' : 'bg', () => {
-          syncWrapperHeaderUI(wrapper, st);
-        });
+      if (forceAll || (wantManual && (fb.status === 'idle' || fb.status === 'error')) || ((canBgTranslate || wantManual) && fb.status === 'idle')) {
+        pendingFiber.push({ fb, priority: (manualScope || wantManual) ? 'high' : 'bg' });
       }
       nextBlocks.push(fb);
     }
 
     st.fiberBlocks = nextBlocks;
+    for (let i = pendingFiber.length - 1; i >= 0; i--) {
+      const item = pendingFiber[i];
+      startFiberBlockTranslation(item.fb, targetLang, model, item.priority, () => {
+        syncWrapperHeaderUI(wrapper, st);
+      }, forceAll);
+    }
     syncWrapperHeaderUI(wrapper, st);
   }
 
   function scanCollapsedToolGroups(targetLang, model, prewarmItems) {
     if (!settings.enabled) return;
-    const buttons = document.querySelectorAll('button[data-testid="tool-group-collapsible"]');
+    const buttons = orderItemsVisibleFirstReverse(
+      Array.from(document.querySelectorAll('button[data-testid="tool-group-collapsible"]')),
+      btn => isElementInVisibleViewport(btn, null)
+    ).ordered;
     for (const btn of buttons) {
       const isExpanded = btn.getAttribute('aria-expanded') === 'true';
       if (isExpanded) continue;
@@ -2470,6 +2633,7 @@
       const stateList = toolGroupStates.get(btn) || [];
       const prevMap = new Map(stateList.map(item => [item.canonKey, item]));
       const nextList = [];
+      const pendingToolFiber = [];
 
       for (const th of thinkings) {
         const blocks = splitMarkdownIntoBlocks(th).filter(b => b.type === 'prose');
@@ -2483,12 +2647,15 @@
             entry = { text: blk.text, canonKey, status: 'idle', targetText: '', fromCache: false, error: '' };
           }
           if (settings.enabled && settings.pretranslateCollapsed && entry.status === 'idle') {
-            startFiberBlockTranslation(entry, targetLang, model, 'bg', null);
+            pendingToolFiber.push(entry);
           }
           nextList.push(entry);
         }
       }
       toolGroupStates.set(btn, nextList);
+      for (let i = pendingToolFiber.length - 1; i >= 0; i--) {
+        startFiberBlockTranslation(pendingToolFiber[i], targetLang, model, 'bg', null, false);
+      }
     }
   }
 
@@ -2711,17 +2878,16 @@
         if (disposed || !wrapper.isConnected) return;
       }
 
-      scanStepAndHeaderTitles(targetLang, model, [], false);
+      const snap = captureQueueSnapshot();
+      scanStepAndHeaderTitles(targetLang, model, [], force, targetBtn);
       const viewportNow = getViewportContainer(wrapper, targetBtn);
       const markdownRootNow = viewportNow ? findMarkdownRoot(viewportNow) : null;
       if (markdownRootNow) {
-        syncExpandedMarkdownBlocks(wrapper, st, markdownRootNow, isTriggerStreaming(targetBtn), targetLang, model, []);
-        translateWrapperNow(wrapper, force);
+        syncExpandedMarkdownBlocks(wrapper, st, viewportNow, markdownRootNow, isTriggerStreaming(targetBtn), targetLang, model, [], { force, manual: true });
       } else {
         const fiberThinking = extractThinkingFromFiber(targetBtn);
         if (fiberThinking) {
-          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, isTriggerStreaming(targetBtn), true, targetLang, model, []);
-          translateWrapperNow(wrapper, force);
+          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, isTriggerStreaming(targetBtn), true, targetLang, model, [], { force, manual: true });
         } else {
           st.autoTranslateOnExpand = true;
           st.forceTranslateOnExpand = force;
@@ -2729,6 +2895,8 @@
           targetBtn.click();
         }
       }
+      promoteNewQueueTasksToFront(snap);
+      flushSchedulerBatches();
       return;
     }
 
@@ -2812,31 +2980,38 @@
     }
     grpState.fiberBlocks = nextGroupFiberBlocks;
 
-    scanStepAndHeaderTitles(targetLang, model, [], force);
+    const snap = captureQueueSnapshot();
+    scanStepAndHeaderTitles(targetLang, model, [], force, targetBtn);
 
-    for (const trig of innerTriggers) {
+    const orderedInnerTriggers = orderItemsVisibleFirstReverse(
+      innerTriggers,
+      trig => isElementInVisibleViewport(trig.parentElement || trig, null)
+    ).ordered;
+    for (const trig of orderedInnerTriggers) {
       const w = trig.parentElement;
       if (!w || !w.isConnected) continue;
       const st = getOrInitBlockState(w);
       const vp = getViewportContainer(w, trig);
       const mdRoot = vp ? findMarkdownRoot(vp) : null;
       if (mdRoot) {
-        syncExpandedMarkdownBlocks(w, st, mdRoot, isTriggerStreaming(trig), targetLang, model, []);
+        syncExpandedMarkdownBlocks(w, st, vp, mdRoot, isTriggerStreaming(trig), targetLang, model, [], { force, manual: true });
       } else {
         const ft = extractThinkingFromFiber(trig);
-        if (ft) syncCollapsedFiberBlocks(w, st, ft, isTriggerStreaming(trig), true, targetLang, model, []);
+        if (ft) syncCollapsedFiberBlocks(w, st, ft, isTriggerStreaming(trig), true, targetLang, model, [], { force, manual: true });
       }
-      translateWrapperNow(w, force);
     }
 
     syncManualGroupBar(groupWrapper, grpState);
-    for (const fb of grpState.fiberBlocks) {
+    for (let i = grpState.fiberBlocks.length - 1; i >= 0; i--) {
+      const fb = grpState.fiberBlocks[i];
       if (force || fb.status === 'idle' || fb.status === 'error') {
         startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
           syncManualGroupBar(groupWrapper, grpState);
-        });
+        }, force);
       }
     }
+    promoteNewQueueTasksToFront(snap);
+    flushSchedulerBatches();
   }
 
   function scanThinkingBlocks() {
@@ -2854,12 +3029,18 @@
 
     const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
     const total = triggers.length;
-
+    const triggerEntries = [];
     for (let idx = 0; idx < total; idx++) {
       const trigger = triggers[idx];
       const wrapper = trigger.parentElement;
-      if (!wrapper) continue;
+      if (wrapper) triggerEntries.push({ trigger, wrapper, idx });
+    }
+    const orderedTriggers = orderItemsVisibleFirstReverse(
+      triggerEntries,
+      item => isElementInVisibleViewport(item.wrapper, null)
+    ).ordered;
 
+    for (const { trigger, wrapper, idx } of orderedTriggers) {
       const isNew = !blockStates.has(wrapper);
       const st = getOrInitBlockState(wrapper);
       if (isNew && !initialScanDone) {
@@ -2875,7 +3056,7 @@
 
       if (markdownRoot) {
         st.fiberBlocks = [];
-        syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems);
+        syncExpandedMarkdownBlocks(wrapper, st, viewport, markdownRoot, streamingNow, targetLang, model, prewarmItems);
       } else {
         // Clear stale DOM maps if collapsed
         if (st.domParas.size > 0) {
@@ -3102,6 +3283,16 @@
     document.addEventListener('mouseover', docMouseOverHandler, true);
     document.addEventListener('mouseout', docMouseOutHandler, true);
 
+    docScrollHandler = () => {
+      if (disposed || scrollPromoteTimer) return;
+      if (!highQueue.length && !bgQueue.length) return;
+      scrollPromoteTimer = setTimeout(() => {
+        scrollPromoteTimer = 0;
+        if (!disposed) promoteVisibleParagraphTasks();
+      }, 100);
+    };
+    document.addEventListener('scroll', docScrollHandler, { capture: true, passive: true });
+
     el('tt-translate-now')?.addEventListener('click', () => {
       const targetLang = getEffectiveTargetLang(settings);
       const model = settings.model || DEFAULT_MODEL;
@@ -3127,7 +3318,11 @@
       }
       scanStepAndHeaderTitles(targetLang, model, [], true);
       scanThinkingBlocks();
-      for (const wrapper of Array.from(trackedWrappers)) {
+      const orderedWrappers = orderItemsVisibleFirstReverse(
+        Array.from(trackedWrappers),
+        w => isElementInVisibleViewport(w, null)
+      ).ordered;
+      for (const wrapper of orderedWrappers) {
         if (!wrapper.isConnected) continue;
         void translateWrapperNow(wrapper, false);
       }
@@ -3219,8 +3414,10 @@
     if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
     if (batchFlushTimer) clearTimeout(batchFlushTimer);
+    if (scrollPromoteTimer) clearTimeout(scrollPromoteTimer);
     if (rafId) cancelAnimationFrame(rafId);
     titleQueue.length = 0;
+    visibleQueue.length = 0;
     highQueue.length = 0;
     bgQueue.length = 0;
     try { themeObserver?.disconnect(); } catch {}
@@ -3229,6 +3426,7 @@
     if (docClickHandler) document.removeEventListener('click', docClickHandler);
     if (docMouseOverHandler) document.removeEventListener('mouseover', docMouseOverHandler, true);
     if (docMouseOutHandler) document.removeEventListener('mouseout', docMouseOutHandler, true);
+    if (docScrollHandler) document.removeEventListener('scroll', docScrollHandler, { capture: true });
     window.removeEventListener('resize', positionPopover);
 
     for (const gw of Array.from(trackedManualGroups)) {
@@ -3308,7 +3506,11 @@
       const targetLang = getEffectiveTargetLang(settings);
       const model = settings.model || DEFAULT_MODEL;
       scanStepAndHeaderTitles(targetLang, model, [], false);
-      for (const w of Array.from(trackedWrappers)) {
+      const orderedWrappers = orderItemsVisibleFirstReverse(
+        Array.from(trackedWrappers),
+        w => isElementInVisibleViewport(w, null)
+      ).ordered;
+      for (const w of orderedWrappers) {
         if (w.isConnected) void translateWrapperNow(w, false);
       }
     }
