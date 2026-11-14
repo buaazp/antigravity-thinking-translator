@@ -89,6 +89,7 @@ async function queryLiveWindow() {
       hasIpcBridge: Boolean(parsed.hasIpcBridge),
       hasLiveBridge: Boolean(parsed.hasLiveBridge),
       enabled: st.enabled ?? null,
+      colorTheme: st.colorTheme || null,
       targetLang: st.targetLang || null,
       displayMode: st.displayMode || null,
       model: st.model || null,

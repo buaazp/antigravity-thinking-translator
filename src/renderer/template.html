@@ -7,20 +7,23 @@
   <div class="tt-header">
     <div class="tt-title-wrap">
       <span>思考过程翻译</span>
-      <span id="tt-version" class="tt-version">v0.3.0</span>
+      <span id="tt-version" class="tt-version">v0.4.0</span>
     </div>
     <button id="tt-close" class="tt-close" type="button" title="关闭">✕</button>
   </div>
 
   <div class="tt-row-inline">
-    <span class="tt-label-inline">自动翻译思考过程</span>
+    <div class="tt-label-stack">
+      <span class="tt-label-inline">自动翻译思考过程</span>
+      <span class="tt-subhint">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>
+    </div>
     <label class="tt-switch">
       <input id="tt-enabled" type="checkbox" checked>
       <span class="tt-slider"></span>
     </label>
   </div>
 
-  <div class="tt-row-inline tt-row-sub">
+  <div id="tt-pretranslate-row" class="tt-row-inline tt-row-sub">
     <div class="tt-label-stack">
       <span class="tt-label-inline">预译未展开的折叠思考</span>
       <span class="tt-subhint">关闭可大幅省额度，标题仍优先自动翻译</span>
@@ -45,6 +48,11 @@
       <button id="tt-mode-bilingual" class="tt-seg-btn" type="button" data-mode="bilingual" data-active="true">显示原文和译文</button>
       <button id="tt-mode-translation" class="tt-seg-btn" type="button" data-mode="translation_only" data-active="false">只显示译文</button>
     </div>
+  </div>
+
+  <div class="tt-row">
+    <span class="tt-label">主题配色（莫兰迪色系）</span>
+    <div id="tt-color-swatches" class="tt-swatches" role="radiogroup" aria-label="主题配色"></div>
   </div>
 
   <div class="tt-row">

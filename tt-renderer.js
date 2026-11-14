@@ -12,10 +12,13 @@
   const {
     PLUGIN_VERSION,
     DEFAULT_MODEL,
+    DEFAULT_COLOR_THEME,
+    COLOR_THEMES,
     CUSTOM_LANG_VALUE,
     SUPPORTED_LANGUAGES,
     FALLBACK_MODELS,
     DEFAULT_SETTINGS,
+    getColorThemeTokens,
     normalizeSettings,
     getEffectiveTargetLang,
     normalizeThinkingText,
@@ -32,14 +35,17 @@
   } = core;
 
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
+  const THEME_VARS_STYLE_ID = 'ag-tt-theme-vars';
   const HOST_ID = 'ag-thinking-translator';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
+  const HOVER_DWELL_MS = 380;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
   const CLIENT_BATCH_MAX_ITEMS = 12;
   const CLIENT_BATCH_MAX_CHARS = 4200;
+  const HOVER_HEADER_SELECTOR = 'button[data-testid="thinking-collapsible-trigger"], button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
   const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
@@ -50,6 +56,7 @@
   let popoverOpen = false;
   let activeTranslations = 0;
   let lastErrorMsg = '';
+  let lastAppliedThemeKey = '';
   let scanTimer = 0;
   let titleSyncRaf = 0;
   let pollTimer = 0;
@@ -57,17 +64,26 @@
   let batchFlushAt = 0;
   let rafId = 0;
   let lastAnimTick = 0;
+  let hoverDwellTimer = 0;
+  let hoveredHeaderBtn = null;
+  let hoverBtnEl = null;
+  let activeHoverHost = null;
+  let activeHoverTarget = null;
   let themeObserver = null;
   let domObserver = null;
   let titlebarResizeObserver = null;
   let observedTitlebar = null;
   let docClickHandler = null;
+  let docMouseOverHandler = null;
+  let docMouseOutHandler = null;
   let reqSeq = 0;
   let initialScanDone = false;
 
-  // Wrapper, title & paragraph state tracking
+  // Wrapper, title, group & paragraph state tracking
   const blockStates = new WeakMap();
   const trackedWrappers = new Set();
+  const trackedManualGroups = new Set();
+  const manualGroupStates = new WeakMap();
   const titleStates = new Map(); // containerEl -> TitleEntry
   const seenToolGroups = new WeakMap(); // buttonEl -> last thinking fingerprint
   const historicalToolGroups = new WeakSet();
@@ -84,8 +100,8 @@
   const bgQueue = [];
   const activeTasks = new Map(); // taskKey -> Task
 
-  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #6366f1;\n  --tt-accent-soft: rgba(99, 102, 241, 0.12);\n  --tt-accent-text: #4f46e5;\n  --tt-success: #10b981;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #818cf8;\n  --tt-accent-soft: rgba(129, 140, 248, 0.16);\n  --tt-accent-text: #a5b4fc;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-success);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.3.0</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <span class=\"tt-label-inline\">自动翻译思考过程</span>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
+  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #438780;\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\n  --tt-accent-text: #2f6f68;\n  --tt-success: #438780;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #6ab0a8;\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\n  --tt-accent-text: #8ccac2;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-accent);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n  transition: opacity 140ms ease;\n}\n\n.tt-row-sub[data-disabled=\"true\"] {\n  opacity: 0.46;\n  pointer-events: none;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-swatches {\n  display: grid;\n  grid-template-columns: repeat(6, minmax(0, 1fr));\n  gap: 4px;\n}\n\n.tt-swatch-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 3px;\n  min-width: 0;\n  padding: 5px 3px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text-muted);\n  font-size: 10.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n\n.tt-swatch-btn:hover {\n  border-color: var(--tt-accent);\n  color: var(--tt-text);\n}\n\n.tt-swatch-btn[data-active=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-swatch-dot {\n  width: 7px;\n  height: 7px;\n  border-radius: 50%;\n  flex-shrink: 0;\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.0</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -277,6 +293,16 @@
       [data-ag-tt-wrapper="1"][data-ag-tt-has-tools="1"] > button[data-testid="thinking-collapsible-trigger"] {
         padding-right: 196px;
       }
+      [data-ag-tt-manual-group="1"],
+      [data-ag-tt-hover-host="1"] {
+        position: relative;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-has-group-badge="1"] > button[data-testid] {
+        padding-right: 96px;
+      }
+      [data-ag-tt-hover-host="1"] > button[data-testid] {
+        padding-right: 68px;
+      }
       [data-ag-tt-title-mode="translation_only"] > [data-ag-tt-title-ready="1"] {
         display: none !important;
       }
@@ -287,30 +313,22 @@
         line-height: 1.35;
         min-width: 0;
         word-break: break-word;
-        transition: opacity 120ms ease;
+        transition: opacity 120ms ease, color 140ms ease;
       }
       [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
       [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans {
-        color: #6366f1;
-        opacity: 0.92;
+        color: var(--ag-tt-accent-text, #2f6f68);
+        opacity: 0.94;
       }
       [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans::before,
       [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans::before {
         content: "· ";
         opacity: 0.55;
       }
-      html.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
-      html.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans,
-      body.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
-      body.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans,
-      [data-theme="dark"] [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
-      [data-theme="dark"] [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans {
-        color: #a5b4fc;
-      }
       [data-ag-tt-title-mode="translation_only"] > .ag-tt-header-title-trans,
       [data-ag-tt-title-mode="translation_only"] > .ag-tt-step-title-trans {
-        color: inherit;
-        opacity: 0.88;
+        color: var(--ag-tt-accent-text, #2f6f68);
+        opacity: 0.94;
       }
       [data-ag-tt-title-mode="translation_only"][data-ag-tt-title-interactive="1"] > .ag-tt-header-title-trans::before,
       [data-ag-tt-title-mode="translation_only"][data-ag-tt-title-interactive="1"] > .ag-tt-step-title-trans::before {
@@ -331,14 +349,15 @@
         row-gap: 1px;
       }
       .ag-tt-title-pending {
-        opacity: 0.52;
+        opacity: 0.62;
         font-size: 0.92em;
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] [data-markdown-root] > [data-ag-tt-orig-ready="1"],
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] .ag-tt-fallback-root > [data-ag-tt-orig-ready="1"] {
         display: none !important;
       }
-      .ag-tt-trigger-bar {
+      .ag-tt-trigger-bar,
+      .ag-tt-group-bar {
         position: absolute;
         top: 5px;
         right: 26px;
@@ -349,7 +368,8 @@
         user-select: none;
       }
       .ag-tt-mini-btn,
-      .ag-tt-trigger-badge {
+      .ag-tt-trigger-badge,
+      .ag-tt-group-badge {
         display: inline-flex;
         align-items: center;
         gap: 4px;
@@ -361,41 +381,68 @@
         cursor: pointer;
         user-select: none;
         backdrop-filter: blur(4px);
-        border: 1px solid rgba(99, 102, 241, 0.24);
-        background: rgba(99, 102, 241, 0.11);
-        color: #6366f1;
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
+        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        color: var(--ag-tt-accent-text, #2f6f68);
+        transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
       }
       .ag-tt-mini-btn {
         background: rgba(128, 128, 128, 0.08);
         border-color: rgba(128, 128, 128, 0.24);
         color: inherit;
-        opacity: 0.78;
+        opacity: 0.8;
       }
       .ag-tt-mini-btn:hover {
         opacity: 1;
-        border-color: #6366f1;
+        border-color: var(--ag-tt-accent, #438780);
+        color: var(--ag-tt-accent-text, #2f6f68);
       }
-      html.dark .ag-tt-trigger-badge,
-      body.dark .ag-tt-trigger-badge,
-      [data-theme="dark"] .ag-tt-trigger-badge {
-        color: #a5b4fc;
-        background: rgba(129, 140, 248, 0.16);
-        border-color: rgba(129, 140, 248, 0.3);
-      }
-      .ag-tt-trigger-badge[data-status="translating"] {
-        color: #4f46e5;
+      .ag-tt-trigger-badge[data-status="translating"],
+      .ag-tt-group-badge[data-status="translating"] {
+        color: var(--ag-tt-accent-strong, #245953);
         animation: agTtPulse 1.2s ease-in-out infinite;
       }
-      html.dark .ag-tt-trigger-badge[data-status="translating"] {
-        color: #c7d2fe;
-      }
-      .ag-tt-trigger-badge[data-status="error"] {
+      .ag-tt-trigger-badge[data-status="error"],
+      .ag-tt-group-badge[data-status="error"] {
         color: #ef4444;
         background: rgba(239, 68, 68, 0.12);
         border-color: rgba(239, 68, 68, 0.28);
       }
-      .ag-tt-trigger-badge[data-status="idle"] {
-        opacity: 0.8;
+      .ag-tt-trigger-badge[data-status="idle"],
+      .ag-tt-group-badge[data-status="idle"] {
+        opacity: 0.85;
+      }
+      .ag-tt-hover-translate-btn {
+        position: absolute;
+        top: 5px;
+        right: 26px;
+        z-index: 3;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1.35;
+        font-weight: 500;
+        cursor: pointer;
+        user-select: none;
+        backdrop-filter: blur(6px);
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
+        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        color: var(--ag-tt-accent-text, #2f6f68);
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+        animation: agTtHoverIn 140ms ease-out both;
+        transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+      }
+      .ag-tt-hover-translate-btn:hover {
+        background: var(--ag-tt-accent, #438780);
+        border-color: var(--ag-tt-accent, #438780);
+        color: #ffffff;
+      }
+      @keyframes agTtHoverIn {
+        from { opacity: 0; transform: scale(0.95); }
+        to { opacity: 1; transform: scale(1); }
       }
       @keyframes agTtPulse {
         0%, 100% { opacity: 1; }
@@ -414,19 +461,14 @@
         word-break: break-word;
         font-size: 13.5px;
         line-height: 1.6;
-        color: inherit;
+        color: var(--ag-tt-para-text, #1f423e);
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans {
-        border-left: 2px solid rgba(99, 102, 241, 0.48);
-        background: rgba(99, 102, 241, 0.045);
+        border-left: 2px solid var(--ag-tt-para-border, rgba(67, 135, 128, 0.48));
+        background: var(--ag-tt-para-bg, rgba(67, 135, 128, 0.05));
         border-radius: 0 6px 6px 0;
         padding: 4px 10px;
         margin: -3px 0 4px 0;
-      }
-      html.dark [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans,
-      body.dark [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"] .ag-tt-para-trans {
-        background: rgba(129, 140, 248, 0.075);
-        border-left-color: rgba(129, 140, 248, 0.55);
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] .ag-tt-para-trans {
         border-left: none;
@@ -479,12 +521,13 @@
         margin-left: 3px;
         vertical-align: -0.1em;
         border-radius: 1px;
-        background: #6366f1;
+        background: var(--ag-tt-accent, #438780);
         animation: agTtCaretBlink 0.9s infinite;
       }
       .ag-tt-shimmer-wait {
         font-size: 12px;
-        opacity: 0.68;
+        color: var(--ag-tt-accent-text, #2f6f68);
+        opacity: 0.78;
       }
       .ag-tt-para-error {
         font-size: 12px;
@@ -495,7 +538,7 @@
   }
 
   // =========================================================================
-  // Theme & Titlebar Docking
+  // Theme, Morandi Palette & Titlebar Docking
   // =========================================================================
   function detectDarkTheme() {
     try {
@@ -512,8 +555,44 @@
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches || false;
   }
 
+  function applyColorTheme() {
+    const isDark = detectDarkTheme();
+    const tokens = getColorThemeTokens(settings.colorTheme || DEFAULT_COLOR_THEME, isDark);
+
+    host.style.setProperty('--tt-accent', tokens.accent);
+    host.style.setProperty('--tt-accent-soft', tokens.accentSoft);
+    host.style.setProperty('--tt-accent-text', tokens.accentText);
+
+    const themeKey = `${tokens.id}:${isDark ? 'dark' : 'light'}`;
+    if (themeKey === lastAppliedThemeKey && document.getElementById(THEME_VARS_STYLE_ID)) {
+      return;
+    }
+    lastAppliedThemeKey = themeKey;
+
+    if (!document.head) return;
+    let varsEl = document.getElementById(THEME_VARS_STYLE_ID);
+    if (!varsEl) {
+      varsEl = document.createElement('style');
+      varsEl.id = THEME_VARS_STYLE_ID;
+      document.head.appendChild(varsEl);
+    }
+    varsEl.textContent = `
+      :root {
+        --ag-tt-accent: ${tokens.accent};
+        --ag-tt-accent-text: ${tokens.accentText};
+        --ag-tt-accent-strong: ${tokens.accentStrong};
+        --ag-tt-accent-soft: ${tokens.accentSoft};
+        --ag-tt-badge-border: ${tokens.badgeBorder};
+        --ag-tt-para-border: ${tokens.paraBorder};
+        --ag-tt-para-bg: ${tokens.paraBg};
+        --ag-tt-para-text: ${tokens.paraText};
+      }
+    `;
+  }
+
   function syncTheme() {
     host.setAttribute('data-theme', detectDarkTheme() ? 'dark' : 'light');
+    applyColorTheme();
   }
 
   function findHostTitlebar() {
@@ -620,12 +699,57 @@
     levelSelect.disabled = sel.group.options.length <= 1;
   }
 
+  function renderColorSwatches() {
+    const wrap = el('tt-color-swatches');
+    if (!wrap || !Array.isArray(COLOR_THEMES)) return;
+    if (!wrap.children.length) {
+      for (const preset of COLOR_THEMES) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'tt-swatch-btn';
+        btn.setAttribute('role', 'radio');
+        btn.setAttribute('data-color-theme', preset.id);
+        btn.title = preset.title || preset.label;
+
+        const dot = document.createElement('span');
+        dot.className = 'tt-swatch-dot';
+        dot.style.backgroundColor = preset.swatch;
+
+        const text = document.createElement('span');
+        text.textContent = preset.label;
+
+        btn.appendChild(dot);
+        btn.appendChild(text);
+        btn.addEventListener('click', () => {
+          if (settings.colorTheme !== preset.id) {
+            void persistSettings({ colorTheme: preset.id });
+          }
+        });
+        wrap.appendChild(btn);
+      }
+    }
+    const activeId = settings.colorTheme || DEFAULT_COLOR_THEME;
+    for (const btn of wrap.children) {
+      const isSelected = btn.getAttribute('data-color-theme') === activeId;
+      btn.setAttribute('data-active', isSelected ? 'true' : 'false');
+      btn.setAttribute('aria-checked', isSelected ? 'true' : 'false');
+    }
+  }
+
   function renderSettingsUI() {
+    applyColorTheme();
     if (el('tt-version')) el('tt-version').textContent = `v${PLUGIN_VERSION}`;
     const enabledInput = el('tt-enabled');
     if (enabledInput) enabledInput.checked = Boolean(settings.enabled);
     const pretranslateInput = el('tt-pretranslate-collapsed');
-    if (pretranslateInput) pretranslateInput.checked = Boolean(settings.pretranslateCollapsed);
+    if (pretranslateInput) {
+      pretranslateInput.checked = Boolean(settings.pretranslateCollapsed);
+      pretranslateInput.disabled = !settings.enabled;
+    }
+    const pretranslateRow = el('tt-pretranslate-row');
+    if (pretranslateRow) {
+      pretranslateRow.setAttribute('data-disabled', settings.enabled ? 'false' : 'true');
+    }
 
     const langSelect = el('tt-target-lang');
     if (langSelect) {
@@ -654,6 +778,7 @@
     if (modeBi) modeBi.setAttribute('data-active', settings.displayMode === 'bilingual' ? 'true' : 'false');
     if (modeTr) modeTr.setAttribute('data-active', settings.displayMode === 'translation_only' ? 'true' : 'false');
 
+    renderColorSwatches();
     renderModelCascadeSelects();
 
     const cap = el('tt-capsule');
@@ -676,7 +801,7 @@
       } else if (lastErrorMsg) {
         statusText.textContent = `最近错误: ${lastErrorMsg.slice(0, 48)}`;
       } else if (!settings.enabled) {
-        statusText.textContent = '已暂停自动翻译';
+        statusText.textContent = '已暂停自动翻译（悬停标题右侧可手动翻译）';
       } else {
         statusText.textContent = `就绪 · ${getModelLabel(settings.model)}`;
       }
@@ -705,7 +830,10 @@
     }
   }
 
-  function resetAllTranslationStates(clearMem = false) {
+  function resetAllTranslationStates(opts = false) {
+    const clearMem = typeof opts === 'boolean' ? opts : Boolean(opts?.clearMem);
+    const clearManual = typeof opts === 'object' && opts !== null ? Boolean(opts.clearManual) : false;
+
     if (clearMem) {
       memCache.clear();
       checkedCanonMisses.clear();
@@ -722,12 +850,34 @@
       entry.canonKey = '';
       entry.error = '';
       entry.fromCache = false;
+      if (clearManual) entry.manualRequested = false;
       if (entry.origEl?.isConnected) entry.origEl.removeAttribute('data-ag-tt-title-ready');
       if (entry.transEl?.isConnected) entry.transEl.remove();
       containerEl.removeAttribute('data-ag-tt-title-mode');
       containerEl.removeAttribute('data-ag-tt-title-interactive');
+      containerEl.removeAttribute('data-ag-tt-title-slot');
       containerEl.removeAttribute('data-ag-tt-header-wrap');
       titleStates.delete(containerEl);
+    }
+
+    for (const gw of Array.from(trackedManualGroups)) {
+      if (!gw.isConnected || clearManual) {
+        if (gw.isConnected) {
+          gw.removeAttribute('data-ag-tt-manual-group');
+          gw.removeAttribute('data-ag-tt-has-group-badge');
+          for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) {
+            bar.remove();
+          }
+        }
+        manualGroupStates.delete(gw);
+        trackedManualGroups.delete(gw);
+      } else {
+        const grpState = manualGroupStates.get(gw);
+        if (grpState) {
+          grpState.fiberBlocks = [];
+          syncManualGroupBar(gw, grpState);
+        }
+      }
     }
 
     for (const wrapper of Array.from(trackedWrappers)) {
@@ -739,6 +889,9 @@
       if (!st) continue;
       st.fiberBlocks = [];
       st.hasStartedTranslation = false;
+      if (clearManual) st.manualActivated = false;
+      st.autoTranslateOnExpand = false;
+      st.forceTranslateOnExpand = false;
       for (const p of st.domParas.values()) {
         p.status = 'idle';
         p.targetText = '';
@@ -751,8 +904,24 @@
         if (p.transEl?.isConnected) p.transEl.remove();
       }
       st.domParas.clear();
+      st.orderedOrigEls = [];
+      for (const stray of wrapper.querySelectorAll('[data-ag-tt-para]')) {
+        stray.remove();
+      }
+      for (const orig of wrapper.querySelectorAll('[data-ag-tt-orig-ready]')) {
+        orig.removeAttribute('data-ag-tt-orig-ready');
+      }
+      if (!isRegionAllowed(wrapper, st)) {
+        wrapper.removeAttribute('data-ag-tt-mode');
+        wrapper.removeAttribute('data-ag-tt-active');
+      }
       syncWrapperHeaderUI(wrapper, st);
     }
+  }
+
+  function deactivateAllToVanilla() {
+    hideHoverTranslateButton();
+    resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
   async function persistSettings(partial) {
@@ -761,7 +930,18 @@
     const prevModel = settings.model;
     settings = normalizeSettings({ ...settings, ...partial });
     if (prevEnabled && !settings.enabled) {
-      clearQueuedTasks();
+      deactivateAllToVanilla();
+    } else if (!prevEnabled && settings.enabled) {
+      hideHoverTranslateButton();
+      for (const gw of Array.from(trackedManualGroups)) {
+        if (gw.isConnected) {
+          gw.removeAttribute('data-ag-tt-manual-group');
+          gw.removeAttribute('data-ag-tt-has-group-badge');
+          for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) bar.remove();
+        }
+        manualGroupStates.delete(gw);
+      }
+      trackedManualGroups.clear();
     }
     renderSettingsUI();
 
@@ -778,7 +958,9 @@
     const configChanged = prevLang !== nextLang || prevModel !== settings.model;
 
     if (configChanged) {
-      resetAllTranslationStates(true);
+      resetAllTranslationStates({ clearMem: true, clearManual: false });
+    } else if (!settings.enabled && prevEnabled) {
+      deactivateAllToVanilla();
     } else {
       for (const wrapper of Array.from(trackedWrappers)) {
         if (!wrapper.isConnected) {
@@ -833,9 +1015,12 @@
     let cur = getReactFiber(buttonEl);
     for (let i = 0; i < 12 && cur; i++) {
       const props = cur.memoizedProps;
-      if (props && Array.isArray(props.steps)) {
+      const steps = Array.isArray(props?.steps)
+        ? props.steps
+        : (Array.isArray(props?.segment?.steps) ? props.segment.steps : null);
+      if (steps) {
         const list = [];
-        for (const s of props.steps) {
+        for (const s of steps) {
           const val = s?.step?.value;
           const th = val?.rawThinking || val?.thinking;
           if (typeof th === 'string' && th.trim()) {
@@ -910,6 +1095,15 @@
     return blocks;
   }
 
+  function isRegionAllowed(node, wrapperSt = null) {
+    if (settings.enabled) return true;
+    if (wrapperSt && wrapperSt.manualActivated) return true;
+    if (node && typeof node.closest === 'function' && node.closest('[data-ag-tt-manual-group="1"]')) {
+      return true;
+    }
+    return false;
+  }
+
   function getOrInitBlockState(wrapper) {
     let st = blockStates.get(wrapper);
     if (!st) {
@@ -917,6 +1111,7 @@
         seenOnInitialScan: false,
         wasStreaming: false,
         hasStartedTranslation: false,
+        manualActivated: false,
         autoTranslateOnExpand: false,
         forceTranslateOnExpand: false,
         localViewMode: null,
@@ -1157,7 +1352,7 @@
     }
   }
 
-  async function prewarmBackendCache(items, targetLang, model) {
+  async function prewarmBackendCache(items, targetLang, model, opts = {}) {
     const unqueried = [];
     const seenKeys = new Set();
     for (const item of items) {
@@ -1182,7 +1377,7 @@
           cacheCount = res.cacheStats.count;
         }
         renderSettingsUI();
-        scheduleScan();
+        if (!opts.skipScan) scheduleScan();
       }
     } catch {}
   }
@@ -1366,6 +1561,13 @@
   }
 
   function syncWrapperModeAndOrigVisibility(wrapper, st) {
+    const allowed = isRegionAllowed(wrapper, st);
+    if (!allowed) {
+      wrapper.removeAttribute('data-ag-tt-mode');
+      wrapper.removeAttribute('data-ag-tt-active');
+      syncWrapperHeaderUI(wrapper, st, { total: 0, done: 0, translating: 0, errorCount: 0, overallStatus: 'idle', hasTranslatedContent: false });
+      return;
+    }
     const mode = getEffectiveWrapperMode(st);
     wrapper.setAttribute('data-ag-tt-mode', mode);
     const prog = computeWrapperProgress(st);
@@ -1385,6 +1587,17 @@
         bar = child;
         break;
       }
+    }
+
+    const allowed = isRegionAllowed(wrapper, st);
+    const prog = precomputedProg || computeWrapperProgress(st);
+    const visible = allowed && (settings.enabled || st.manualActivated || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0);
+
+    if (!visible) {
+      if (bar) bar.style.display = 'none';
+      wrapper.removeAttribute('data-ag-tt-has-badge');
+      wrapper.removeAttribute('data-ag-tt-has-tools');
+      return;
     }
 
     if (!bar) {
@@ -1462,7 +1675,6 @@
       wrapper.appendChild(bar);
     }
 
-    const prog = precomputedProg || computeWrapperProgress(st);
     const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
     const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
     const showTools = isExpanded && (prog.translating > 0 || prog.done > 0);
@@ -1505,11 +1717,9 @@
       }
     }
 
-    const visible = settings.enabled || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0;
-    bar.style.display = visible ? 'inline-flex' : 'none';
-    if (visible) wrapper.setAttribute('data-ag-tt-has-badge', '1');
-    else wrapper.removeAttribute('data-ag-tt-has-badge');
-    if (visible && showTools) wrapper.setAttribute('data-ag-tt-has-tools', '1');
+    bar.style.display = 'inline-flex';
+    wrapper.setAttribute('data-ag-tt-has-badge', '1');
+    if (showTools) wrapper.setAttribute('data-ag-tt-has-tools', '1');
     else wrapper.removeAttribute('data-ag-tt-has-tools');
   }
 
@@ -1594,24 +1804,38 @@
   }
 
   function syncTitleEntryUI(entry) {
-    const { containerEl, origEl, transEl, targetText, status, isRawCodeFallback, hasInteractiveChip, wrapperSt } = entry;
-    if (!containerEl?.isConnected || !origEl?.isConnected || !transEl?.isConnected) return;
+    const { containerEl, origEl, transEl, insertBeforeEl, isStepSlot, targetText, status, isRawCodeFallback, hasInteractiveChip, wrapperSt } = entry;
+    if (!containerEl?.isConnected || !origEl?.isConnected || !transEl) return;
 
+    const liveText = readVisibleDomText(origEl, '').replace(/\s+/g, ' ').trim();
+    const isStaleText = Boolean(entry.text && liveText && liveText !== entry.text);
+    const allowDisplay = Boolean(isRegionAllowed(containerEl, wrapperSt) || entry.manualRequested);
+    const canShow = allowDisplay && !isStaleText && status !== 'skipped' && !isRawCodeFallback;
+    if (!canShow) {
+      origEl.removeAttribute('data-ag-tt-title-ready');
+      if (transEl.isConnected) {
+        transEl.style.display = 'none';
+        transEl.textContent = '';
+      }
+      containerEl.removeAttribute('data-ag-tt-title-mode');
+      containerEl.removeAttribute('data-ag-tt-title-interactive');
+      containerEl.removeAttribute('data-ag-tt-title-slot');
+      containerEl.removeAttribute('data-ag-tt-header-wrap');
+      return;
+    }
+
+    if (isStepSlot) containerEl.setAttribute('data-ag-tt-title-slot', '1');
     const mode = wrapperSt ? getEffectiveWrapperMode(wrapperSt) : settings.displayMode;
     containerEl.setAttribute('data-ag-tt-title-mode', mode);
     if (hasInteractiveChip) containerEl.setAttribute('data-ag-tt-title-interactive', '1');
     else containerEl.removeAttribute('data-ag-tt-title-interactive');
 
-    const liveText = readVisibleDomText(origEl, '').replace(/\s+/g, ' ').trim();
-    const isStaleText = Boolean(entry.text && liveText && liveText !== entry.text);
-    const allowDisplay = Boolean(settings.enabled || entry.manualRequested || entry.wrapperSt?.hasStartedTranslation);
-    const canShow = allowDisplay && !isStaleText && status !== 'skipped' && !isRawCodeFallback;
-    if (!canShow) {
-      origEl.removeAttribute('data-ag-tt-title-ready');
-      transEl.style.display = 'none';
-      transEl.textContent = '';
-      containerEl.removeAttribute('data-ag-tt-header-wrap');
-      return;
+    if (insertBeforeEl && insertBeforeEl.parentElement === containerEl) {
+      if (transEl.parentElement !== containerEl || transEl.nextElementSibling !== insertBeforeEl) {
+        containerEl.insertBefore(transEl, insertBeforeEl);
+      }
+    } else if (transEl.parentElement !== containerEl) {
+      containerEl.appendChild(transEl);
     }
 
     if (targetText) {
@@ -1760,10 +1984,15 @@
     const targets = collectTitleTargets();
     for (const t of targets) {
       const { containerEl, origEl, insertBeforeEl, className, isStepSlot, wrapperSt } = t;
-      if (isStepSlot) containerEl.setAttribute('data-ag-tt-title-slot', '1');
+      let entry = titleStates.get(containerEl);
+      const regionAllowed = isRegionAllowed(containerEl, wrapperSt);
+
+      if (!forceAll && !regionAllowed && (!entry || !entry.manualRequested)) {
+        if (entry) syncTitleEntryUI(entry);
+        continue;
+      }
 
       const info = extractCleanTitleInfo(origEl);
-      let entry = titleStates.get(containerEl);
 
       if (!entry) {
         let transEl = Array.from(containerEl.children).find(
@@ -1778,6 +2007,8 @@
           containerEl,
           origEl,
           transEl,
+          insertBeforeEl,
+          isStepSlot,
           wrapperSt,
           text: '',
           canonKey: '',
@@ -1792,15 +2023,9 @@
         titleStates.set(containerEl, entry);
       } else {
         entry.origEl = origEl;
+        entry.insertBeforeEl = insertBeforeEl;
+        entry.isStepSlot = isStepSlot;
         entry.wrapperSt = wrapperSt;
-      }
-
-      if (insertBeforeEl && insertBeforeEl.parentElement === containerEl) {
-        if (entry.transEl.parentElement !== containerEl || entry.transEl.nextElementSibling !== insertBeforeEl) {
-          containerEl.insertBefore(entry.transEl, insertBeforeEl);
-        }
-      } else if (entry.transEl.parentElement !== containerEl) {
-        containerEl.appendChild(entry.transEl);
       }
 
       entry.isRawCodeFallback = info.isRawCodeFallback;
@@ -1837,7 +2062,7 @@
         entry.manualRequested = true;
       }
 
-      const allowTitleTranslate = Boolean(settings.enabled || forceAll || entry.manualRequested || entry.wrapperSt?.hasStartedTranslation);
+      const allowTitleTranslate = Boolean(isRegionAllowed(containerEl, wrapperSt) || forceAll || entry.manualRequested);
       if (!allowTitleTranslate) {
         syncTitleEntryUI(entry);
         continue;
@@ -1872,7 +2097,7 @@
 
       prewarmItems.push({ text: info.fullText });
 
-      if (forceAll || (settings.enabled && entry.status === 'idle')) {
+      if (forceAll || (allowTitleTranslate && entry.status === 'idle')) {
         startTitleTranslation(entry, targetLang, model, forceAll);
       } else {
         syncTitleEntryUI(entry);
@@ -2021,6 +2246,24 @@
   }
 
   function syncExpandedMarkdownBlocks(wrapper, st, markdownRoot, streamingNow, targetLang, model, prewarmItems) {
+    const allowed = isRegionAllowed(wrapper, st);
+    if (!allowed) {
+      for (const p of st.domParas.values()) {
+        if (p.origEl?.isConnected) p.origEl.removeAttribute('data-ag-tt-orig-ready');
+        if (p.transEl?.isConnected) p.transEl.remove();
+      }
+      st.domParas.clear();
+      st.orderedOrigEls = [];
+      for (const stray of markdownRoot.querySelectorAll(':scope > [data-ag-tt-para]')) {
+        stray.remove();
+      }
+      for (const orig of markdownRoot.querySelectorAll(':scope > [data-ag-tt-orig-ready]')) {
+        orig.removeAttribute('data-ag-tt-orig-ready');
+      }
+      syncWrapperModeAndOrigVisibility(wrapper, st);
+      return;
+    }
+
     const domBlocks = collectTranslatableDomBlocks(markdownRoot);
     const activeOrigSet = new Set(domBlocks.map(b => b.origEl));
     const now = Date.now();
@@ -2104,7 +2347,7 @@
       prewarmItems.push({ text });
 
       const isTrailingBlock = i === domBlocks.length - 1;
-      const autoTrigger = settings.enabled && (!streamingNow || !isTrailingBlock || (now - p.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
+      const autoTrigger = allowed && (!streamingNow || !isTrailingBlock || (now - p.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
 
       if (forceAll || (wantExpandTranslate && p.status === 'idle') || (autoTrigger && p.status === 'idle')) {
         startDomParaTranslation(wrapper, st, p, targetLang, model, forceAll, 'high');
@@ -2117,6 +2360,13 @@
   }
 
   function syncCollapsedFiberBlocks(wrapper, st, fiberThinking, streamingNow, isRecentOrLive, targetLang, model, prewarmItems) {
+    const allowed = isRegionAllowed(wrapper, st);
+    if (!allowed) {
+      st.fiberBlocks = [];
+      syncWrapperModeAndOrigVisibility(wrapper, st);
+      return;
+    }
+
     const rawBlocks = splitMarkdownIntoBlocks(fiberThinking).filter(b => b.type === 'prose');
     const now = Date.now();
     const prevByCanon = new Map();
@@ -2159,10 +2409,12 @@
       prewarmItems.push({ text });
 
       const isTrailing = i === rawBlocks.length - 1;
-      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation);
-      const canBgTranslate = settings.enabled && allowCollapsedBg && isRecentOrLive && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
+      const manualScope = Boolean(st.manualActivated || wrapper.closest('[data-ag-tt-manual-group="1"]'));
+      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation || manualScope);
+      const eligibleRecency = isRecentOrLive || manualScope;
+      const canBgTranslate = allowed && allowCollapsedBg && eligibleRecency && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
       if (canBgTranslate && fb.status === 'idle') {
-        startFiberBlockTranslation(fb, targetLang, model, 'bg', () => {
+        startFiberBlockTranslation(fb, targetLang, model, manualScope ? 'high' : 'bg', () => {
           syncWrapperHeaderUI(wrapper, st);
         });
       }
@@ -2174,6 +2426,7 @@
   }
 
   function scanCollapsedToolGroups(targetLang, model, prewarmItems) {
+    if (!settings.enabled) return;
     const buttons = document.querySelectorAll('button[data-testid="tool-group-collapsible"]');
     for (const btn of buttons) {
       const isExpanded = btn.getAttribute('aria-expanded') === 'true';
@@ -2239,16 +2492,364 @@
     }
   }
 
+  function syncManualGroupBar(groupWrapper, grpState) {
+    if (!groupWrapper || !groupWrapper.isConnected || !grpState) return;
+    if (settings.enabled || !groupWrapper.hasAttribute('data-ag-tt-manual-group')) {
+      groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
+      for (const old of groupWrapper.querySelectorAll(':scope > .ag-tt-group-bar')) old.remove();
+      return;
+    }
+
+    let bar = null;
+    for (const child of groupWrapper.children) {
+      if (child.classList && child.classList.contains('ag-tt-group-bar')) {
+        bar = child;
+        break;
+      }
+    }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'ag-tt-group-bar';
+      bar.setAttribute('data-ag-tt-ui', '1');
+      const badge = document.createElement('span');
+      badge.className = 'ag-tt-group-badge';
+      badge.setAttribute('role', 'button');
+      badge.tabIndex = -1;
+      badge.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const btn = grpState.targetBtn;
+        if (!btn || !btn.isConnected) return;
+        if (btn.getAttribute('aria-expanded') !== 'true') {
+          btn.click();
+          return;
+        }
+        void triggerManualRegionTranslation(btn, true);
+      });
+      bar.appendChild(badge);
+      groupWrapper.appendChild(bar);
+    }
+
+    let total = 0;
+    let done = 0;
+    let translating = 0;
+    let errorCount = 0;
+
+    const targetBtn = grpState.targetBtn;
+    const isExpanded = targetBtn?.getAttribute('aria-expanded') === 'true';
+
+    if (!isExpanded && grpState.fiberBlocks.length > 0) {
+      for (const fb of grpState.fiberBlocks) {
+        if (fb.status === 'skipped') continue;
+        total++;
+        if (fb.status === 'done') done++;
+        else if (fb.status === 'translating' || fb.status === 'queued') translating++;
+        else if (fb.status === 'error') errorCount++;
+      }
+    } else {
+      for (const trig of groupWrapper.querySelectorAll('button[data-testid="thinking-collapsible-trigger"]')) {
+        const w = trig.parentElement;
+        const st = w ? blockStates.get(w) : null;
+        if (!st) continue;
+        const p = computeWrapperProgress(st);
+        total += p.total;
+        done += p.done;
+        translating += p.translating;
+        errorCount += p.errorCount;
+      }
+    }
+
+    let titlesTranslating = 0;
+    for (const entry of titleStates.values()) {
+      if (entry?.containerEl?.isConnected && (entry.containerEl === targetBtn || groupWrapper.contains(entry.containerEl))) {
+        if (entry.status === 'translating' || entry.status === 'queued') titlesTranslating++;
+      }
+    }
+
+    let status = 'done';
+    if (translating > 0 || (total === 0 && titlesTranslating > 0)) status = 'translating';
+    else if (errorCount > 0 && done === 0) status = 'error';
+    else if (total > 0 && done < total) status = 'partial';
+
+    const effLang = getEffectiveTargetLang(settings);
+    const badge = bar.querySelector('.ag-tt-group-badge');
+    if (badge) {
+      badge.setAttribute('data-status', status);
+      if (status === 'translating') {
+        badge.textContent = total > 1 ? `译中 ${done}/${total}` : '译中...';
+        badge.title = '正在翻译该区域标题与思考详情';
+      } else if (status === 'error') {
+        badge.textContent = '译失败';
+        badge.title = '点击重试翻译';
+      } else if (status === 'partial') {
+        badge.textContent = `已译 ${done}/${total}`;
+        badge.title = isExpanded ? '点击重译' : '点击展开查看详情';
+      } else {
+        badge.textContent = `已译 · ${effLang}`;
+        badge.title = isExpanded ? '点击重新翻译该区域' : '点击展开查看译文';
+      }
+    }
+
+    bar.style.display = 'inline-flex';
+    groupWrapper.setAttribute('data-ag-tt-has-group-badge', '1');
+  }
+
+  function hideHoverTranslateButton() {
+    if (hoverDwellTimer) {
+      clearTimeout(hoverDwellTimer);
+      hoverDwellTimer = 0;
+    }
+    hoveredHeaderBtn = null;
+    activeHoverTarget = null;
+    if (activeHoverHost && activeHoverHost.isConnected) {
+      activeHoverHost.removeAttribute('data-ag-tt-hover-host');
+    }
+    activeHoverHost = null;
+    if (hoverBtnEl && hoverBtnEl.isConnected) {
+      hoverBtnEl.remove();
+    }
+  }
+
+  function isHeaderAlreadyActivated(btn) {
+    if (!btn || !btn.isConnected) return true;
+    const isThinkingTrig = btn.getAttribute('data-testid') === 'thinking-collapsible-trigger';
+    const wrapper = btn.parentElement;
+    const st = isThinkingTrig && wrapper ? blockStates.get(wrapper) : null;
+    return isRegionAllowed(wrapper || btn, st);
+  }
+
+  function showHoverTranslateButton(headerBtn) {
+    if (disposed || settings.enabled || !headerBtn || !headerBtn.isConnected) return;
+    if (isHeaderAlreadyActivated(headerBtn)) return;
+    const hostEl = headerBtn.parentElement;
+    if (!hostEl || !hostEl.isConnected) return;
+
+    if (!hoverBtnEl) {
+      hoverBtnEl = document.createElement('button');
+      hoverBtnEl.type = 'button';
+      hoverBtnEl.className = 'ag-tt-hover-translate-btn';
+      hoverBtnEl.setAttribute('data-ag-tt-ui', '1');
+      hoverBtnEl.textContent = '翻译';
+      hoverBtnEl.title = '手动翻译该区域内的标题和思考详情';
+      hoverBtnEl.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const target = activeHoverTarget;
+        hideHoverTranslateButton();
+        if (target && target.isConnected) {
+          void triggerManualRegionTranslation(target, false);
+        }
+      });
+    }
+
+    if (activeHoverHost && activeHoverHost !== hostEl && activeHoverHost.isConnected) {
+      activeHoverHost.removeAttribute('data-ag-tt-hover-host');
+    }
+    activeHoverHost = hostEl;
+    activeHoverTarget = headerBtn;
+    hostEl.setAttribute('data-ag-tt-hover-host', '1');
+    if (hoverBtnEl.parentElement !== hostEl) {
+      hostEl.appendChild(hoverBtnEl);
+    }
+  }
+
+  function resolveHoverHeaderButton(node) {
+    if (!node || node.nodeType !== 1) return null;
+    if (node.closest('#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], .ag-tt-trigger-bar, .ag-tt-group-bar')) {
+      return null;
+    }
+    if (node.closest('.ag-tt-hover-translate-btn')) {
+      return activeHoverTarget || hoveredHeaderBtn;
+    }
+    return node.closest(HOVER_HEADER_SELECTOR);
+  }
+
+  async function triggerManualRegionTranslation(targetBtn, force = false) {
+    if (disposed || !targetBtn || !targetBtn.isConnected) return;
+    const targetLang = getEffectiveTargetLang(settings);
+    const model = settings.model || DEFAULT_MODEL;
+    const testId = targetBtn.getAttribute('data-testid');
+
+    const collectBtnWarmTitle = (btn, list) => {
+      const firstChild = Array.from(btn.children).find(c => !c.hasAttribute('data-ag-tt-ui'));
+      if (!firstChild) return;
+      const info = extractCleanTitleInfo(firstChild);
+      if (info.fullText && !info.isRawCodeFallback && !translateBoilerplateTitle(info.fullText, targetLang) && shouldTranslateTitle(info.fullText, targetLang)) {
+        list.push({ text: info.fullText });
+      }
+    };
+
+    if (testId === 'thinking-collapsible-trigger') {
+      const wrapper = targetBtn.parentElement;
+      if (!wrapper) return;
+      const st = getOrInitBlockState(wrapper);
+      st.manualActivated = true;
+      st.hasStartedTranslation = true;
+      const trigEntry = titleStates.get(targetBtn);
+      if (trigEntry) trigEntry.manualRequested = true;
+
+      const warmItems = [];
+      if (!force) {
+        collectBtnWarmTitle(targetBtn, warmItems);
+        const vp = getViewportContainer(wrapper, targetBtn);
+        const mdRoot = vp ? findMarkdownRoot(vp) : null;
+        if (mdRoot) {
+          for (const blk of collectTranslatableDomBlocks(mdRoot)) {
+            if (shouldTranslateText(blk.text, targetLang)) warmItems.push({ text: blk.text });
+          }
+        } else {
+          const ft = extractThinkingFromFiber(targetBtn);
+          if (ft) {
+            for (const blk of splitMarkdownIntoBlocks(ft)) {
+              if (blk.type === 'prose' && shouldTranslateText(blk.text, targetLang)) warmItems.push({ text: blk.text });
+            }
+          }
+        }
+        if (warmItems.length > 0) {
+          await prewarmBackendCache(warmItems, targetLang, model, { skipScan: true });
+        }
+        if (disposed || !wrapper.isConnected) return;
+      }
+
+      scanStepAndHeaderTitles(targetLang, model, [], false);
+      const viewportNow = getViewportContainer(wrapper, targetBtn);
+      const markdownRootNow = viewportNow ? findMarkdownRoot(viewportNow) : null;
+      if (markdownRootNow) {
+        syncExpandedMarkdownBlocks(wrapper, st, markdownRootNow, isTriggerStreaming(targetBtn), targetLang, model, []);
+        translateWrapperNow(wrapper, force);
+      } else {
+        const fiberThinking = extractThinkingFromFiber(targetBtn);
+        if (fiberThinking) {
+          syncCollapsedFiberBlocks(wrapper, st, fiberThinking, isTriggerStreaming(targetBtn), true, targetLang, model, []);
+          translateWrapperNow(wrapper, force);
+        } else {
+          st.autoTranslateOnExpand = true;
+          st.forceTranslateOnExpand = force;
+          syncWrapperModeAndOrigVisibility(wrapper, st);
+          targetBtn.click();
+        }
+      }
+      return;
+    }
+
+    // Group headers (`worked-for-collapsible`, `tool-group-collapsible`, `progress-updates-collapsible`)
+    const groupWrapper = targetBtn.parentElement;
+    if (!groupWrapper) return;
+    groupWrapper.setAttribute('data-ag-tt-manual-group', '1');
+    trackedManualGroups.add(groupWrapper);
+
+    let grpState = manualGroupStates.get(groupWrapper);
+    if (!grpState) {
+      grpState = { targetBtn, fiberBlocks: [] };
+      manualGroupStates.set(groupWrapper, grpState);
+    } else {
+      grpState.targetBtn = targetBtn;
+    }
+
+    const warmItems = [];
+    if (!force) collectBtnWarmTitle(targetBtn, warmItems);
+
+    for (const stepRow of groupWrapper.querySelectorAll('div.group.flex.w-full.min-w-0.items-center.min-h-8.select-none')) {
+      const slot = stepRow.children[0];
+      const orig = slot ? Array.from(slot.children).find(c => !c.hasAttribute('data-ag-tt-ui')) : null;
+      if (orig && !force) {
+        const info = extractCleanTitleInfo(orig);
+        if (info.fullText && !info.isRawCodeFallback && !translateBoilerplateTitle(info.fullText, targetLang) && shouldTranslateTitle(info.fullText, targetLang)) {
+          warmItems.push({ text: info.fullText });
+        }
+      }
+    }
+
+    const innerTriggers = Array.from(groupWrapper.querySelectorAll('button[data-testid="thinking-collapsible-trigger"]'));
+    for (const trig of innerTriggers) {
+      if (!force) collectBtnWarmTitle(trig, warmItems);
+      const w = trig.parentElement;
+      if (!w) continue;
+      const st = getOrInitBlockState(w);
+      st.manualActivated = true;
+      st.hasStartedTranslation = true;
+      if (!force) {
+        const vp = getViewportContainer(w, trig);
+        const mdRoot = vp ? findMarkdownRoot(vp) : null;
+        if (mdRoot) {
+          for (const blk of collectTranslatableDomBlocks(mdRoot)) {
+            if (shouldTranslateText(blk.text, targetLang)) warmItems.push({ text: blk.text });
+          }
+        } else {
+          const ft = extractThinkingFromFiber(trig);
+          if (ft) {
+            for (const blk of splitMarkdownIntoBlocks(ft)) {
+              if (blk.type === 'prose' && shouldTranslateText(blk.text, targetLang)) warmItems.push({ text: blk.text });
+            }
+          }
+        }
+      }
+    }
+
+    const fiberThinkings = targetBtn.getAttribute('aria-expanded') === 'true' ? [] : extractToolGroupThinkingsFromFiber(targetBtn);
+    const nextGroupFiberBlocks = [];
+    for (const th of fiberThinkings) {
+      for (const blk of splitMarkdownIntoBlocks(th)) {
+        if (blk.type === 'prose' && shouldTranslateText(blk.text, targetLang)) {
+          const ck = computeCanonicalCacheKey(blk.text, targetLang, model);
+          if (!force) warmItems.push({ text: blk.text });
+          nextGroupFiberBlocks.push({ text: blk.text, canonKey: ck, status: 'idle', targetText: '', fromCache: false, error: '' });
+        }
+      }
+    }
+
+    if (warmItems.length > 0) {
+      await prewarmBackendCache(warmItems, targetLang, model, { skipScan: true });
+    }
+    if (disposed || !groupWrapper.isConnected) return;
+
+    for (const fb of nextGroupFiberBlocks) {
+      if (!force && memCache.has(fb.canonKey)) {
+        fb.status = 'done';
+        fb.targetText = memCache.get(fb.canonKey);
+        fb.fromCache = true;
+      }
+    }
+    grpState.fiberBlocks = nextGroupFiberBlocks;
+
+    scanStepAndHeaderTitles(targetLang, model, [], force);
+
+    for (const trig of innerTriggers) {
+      const w = trig.parentElement;
+      if (!w || !w.isConnected) continue;
+      const st = getOrInitBlockState(w);
+      const vp = getViewportContainer(w, trig);
+      const mdRoot = vp ? findMarkdownRoot(vp) : null;
+      if (mdRoot) {
+        syncExpandedMarkdownBlocks(w, st, mdRoot, isTriggerStreaming(trig), targetLang, model, []);
+      } else {
+        const ft = extractThinkingFromFiber(trig);
+        if (ft) syncCollapsedFiberBlocks(w, st, ft, isTriggerStreaming(trig), true, targetLang, model, []);
+      }
+      translateWrapperNow(w, force);
+    }
+
+    syncManualGroupBar(groupWrapper, grpState);
+    for (const fb of grpState.fiberBlocks) {
+      if (force || fb.status === 'idle' || fb.status === 'error') {
+        startFiberBlockTranslation(fb, targetLang, model, 'high', () => {
+          syncManualGroupBar(groupWrapper, grpState);
+        });
+      }
+    }
+  }
+
   function scanThinkingBlocks() {
     if (disposed) return;
     ensureGlobalStyles();
+    applyColorTheme();
     dockToTitlebar();
 
     const targetLang = getEffectiveTargetLang(settings);
     const model = settings.model || DEFAULT_MODEL;
     const prewarmItems = [];
 
-    // Priority 0: Always translate visible group headers & step titles FIRST
+    // Priority 0: Always translate allowed group headers & step titles FIRST
     scanStepAndHeaderTitles(targetLang, model, prewarmItems, false);
 
     const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
@@ -2294,6 +2895,15 @@
       }
     }
 
+    for (const gw of Array.from(trackedManualGroups)) {
+      if (!gw.isConnected) {
+        trackedManualGroups.delete(gw);
+        manualGroupStates.delete(gw);
+        continue;
+      }
+      syncManualGroupBar(gw, manualGroupStates.get(gw));
+    }
+
     scanCollapsedToolGroups(targetLang, model, prewarmItems);
 
     if (!initialScanDone) {
@@ -2327,6 +2937,7 @@
     return (
       node.id === HOST_ID ||
       node.id === GLOBAL_STYLE_ID ||
+      node.id === THEME_VARS_STYLE_ID ||
       node.hasAttribute('data-ag-tt-para') ||
       node.hasAttribute('data-ag-tt-ui') ||
       node.classList?.contains('ag-tt-token-in') ||
@@ -2349,7 +2960,7 @@
       const target = m.target;
       if (!target) continue;
       const elTarget = target.nodeType === 1 ? target : target.parentElement;
-      if (elTarget && elTarget.closest && elTarget.closest(`#${HOST_ID}, [data-ag-tt-para], [data-ag-tt-ui], #${GLOBAL_STYLE_ID}`)) {
+      if (elTarget && elTarget.closest && elTarget.closest(`#${HOST_ID}, [data-ag-tt-para], [data-ag-tt-ui], #${GLOBAL_STYLE_ID}, #${THEME_VARS_STYLE_ID}`)) {
         continue;
       }
       return false;
@@ -2456,10 +3067,66 @@
       }
     });
 
+    docMouseOverHandler = ev => {
+      if (disposed || settings.enabled) return;
+      const target = ev.target && ev.target.nodeType === 1 ? ev.target : ev.target?.parentElement;
+      const btn = resolveHoverHeaderButton(target);
+      if (!btn || isHeaderAlreadyActivated(btn)) {
+        if (hoveredHeaderBtn && btn !== hoveredHeaderBtn) {
+          hideHoverTranslateButton();
+        }
+        return;
+      }
+      if (btn === activeHoverTarget) return;
+      if (btn === hoveredHeaderBtn && hoverDwellTimer) return;
+
+      hideHoverTranslateButton();
+      hoveredHeaderBtn = btn;
+      hoverDwellTimer = setTimeout(() => {
+        hoverDwellTimer = 0;
+        if (disposed || settings.enabled || hoveredHeaderBtn !== btn || !btn.isConnected) return;
+        showHoverTranslateButton(btn);
+      }, HOVER_DWELL_MS);
+    };
+
+    docMouseOutHandler = ev => {
+      if (disposed || (!hoveredHeaderBtn && !activeHoverTarget)) return;
+      const rel = ev.relatedTarget && ev.relatedTarget.nodeType === 1 ? ev.relatedTarget : ev.relatedTarget?.parentElement;
+      const nextBtn = resolveHoverHeaderButton(rel);
+      if (nextBtn === hoveredHeaderBtn || (activeHoverTarget && nextBtn === activeHoverTarget)) {
+        return;
+      }
+      hideHoverTranslateButton();
+    };
+
+    document.addEventListener('mouseover', docMouseOverHandler, true);
+    document.addEventListener('mouseout', docMouseOutHandler, true);
+
     el('tt-translate-now')?.addEventListener('click', () => {
       const targetLang = getEffectiveTargetLang(settings);
       const model = settings.model || DEFAULT_MODEL;
+      if (!settings.enabled) {
+        hideHoverTranslateButton();
+        for (const btn of document.querySelectorAll('button[data-testid="worked-for-collapsible"], button[data-testid="tool-group-collapsible"], button[data-testid="progress-updates-collapsible"]')) {
+          if (btn.parentElement) {
+            btn.parentElement.setAttribute('data-ag-tt-manual-group', '1');
+            trackedManualGroups.add(btn.parentElement);
+            if (!manualGroupStates.has(btn.parentElement)) {
+              manualGroupStates.set(btn.parentElement, { targetBtn: btn, fiberBlocks: [] });
+            }
+          }
+        }
+        for (const wrapper of Array.from(trackedWrappers)) {
+          if (!wrapper.isConnected) continue;
+          const st = blockStates.get(wrapper);
+          if (st) {
+            st.manualActivated = true;
+            st.hasStartedTranslation = true;
+          }
+        }
+      }
       scanStepAndHeaderTitles(targetLang, model, [], true);
+      scanThinkingBlocks();
       for (const wrapper of Array.from(trackedWrappers)) {
         if (!wrapper.isConnected) continue;
         void translateWrapperNow(wrapper, false);
@@ -2470,7 +3137,7 @@
       try {
         await callBridge('/clear-cache', {});
         cacheCount = 0;
-        resetAllTranslationStates(true);
+        resetAllTranslationStates({ clearMem: true, clearManual: !settings.enabled });
         renderSettingsUI();
         scheduleScan();
       } catch (err) {
@@ -2499,6 +3166,10 @@
         cacheCount = res.cacheStats.count;
       }
     } catch {}
+
+    if (!settings.enabled) {
+      deactivateAllToVanilla();
+    }
 
     try {
       const mRes = await callBridge('/list-models', { force: false });
@@ -2543,6 +3214,7 @@
   function dispose() {
     if (disposed) return;
     disposed = true;
+    hideHoverTranslateButton();
     if (scanTimer) clearTimeout(scanTimer);
     if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
@@ -2555,7 +3227,20 @@
     try { domObserver?.disconnect(); } catch {}
     try { titlebarResizeObserver?.disconnect(); } catch {}
     if (docClickHandler) document.removeEventListener('click', docClickHandler);
+    if (docMouseOverHandler) document.removeEventListener('mouseover', docMouseOverHandler, true);
+    if (docMouseOutHandler) document.removeEventListener('mouseout', docMouseOutHandler, true);
     window.removeEventListener('resize', positionPopover);
+
+    for (const gw of Array.from(trackedManualGroups)) {
+      if (gw.isConnected) {
+        gw.removeAttribute('data-ag-tt-manual-group');
+        gw.removeAttribute('data-ag-tt-has-group-badge');
+        for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar, :scope > [data-ag-tt-ui]')) {
+          bar.remove();
+        }
+      }
+    }
+    trackedManualGroups.clear();
 
     for (const [containerEl, entry] of Array.from(titleStates.entries())) {
       if (entry.origEl?.isConnected) entry.origEl.removeAttribute('data-ag-tt-title-ready');
@@ -2587,12 +3272,16 @@
       }
     }
 
-    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans')) t.remove();
+    for (const hostNode of document.querySelectorAll('[data-ag-tt-hover-host]')) {
+      hostNode.removeAttribute('data-ag-tt-hover-host');
+    }
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-bar')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();
     checkedCanonMisses.clear();
     try { document.getElementById(GLOBAL_STYLE_ID)?.remove(); } catch {}
+    try { document.getElementById(THEME_VARS_STYLE_ID)?.remove(); } catch {}
     try { host.remove(); } catch {}
   }
 
@@ -2604,6 +3293,7 @@
       version: PLUGIN_VERSION,
       enabled: settings.enabled,
       pretranslateCollapsed: settings.pretranslateCollapsed,
+      colorTheme: settings.colorTheme,
       targetLang: getEffectiveTargetLang(settings),
       displayMode: settings.displayMode,
       model: settings.model,

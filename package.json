@@ -1,6 +1,6 @@
 {
   "name": "antigravity-thinking-translator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Auto-translate model thinking blocks in Google Antigravity 2.x using built-in Antigravity models, with configurable target language and bilingual / translation-only display modes.",
   "main": "cli.js",
   "bin": {

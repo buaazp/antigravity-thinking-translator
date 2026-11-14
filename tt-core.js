@@ -10,10 +10,170 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.3.0';
+  const PLUGIN_VERSION = '0.4.0';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
+  const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';
   const BATCH_ITEM_PREFIX = '<<<AG_TT_ITEM_';
+
+  const COLOR_THEMES = [
+    {
+      id: 'celadon',
+      label: '青绿',
+      title: '莫兰迪青绿 (默认)',
+      swatch: '#4d948d',
+      light: {
+        accent: '#438780',
+        accentText: '#2f6f68',
+        accentStrong: '#245953',
+        accentSoft: 'rgba(67, 135, 128, 0.12)',
+        badgeBorder: 'rgba(67, 135, 128, 0.28)',
+        paraBorder: 'rgba(67, 135, 128, 0.48)',
+        paraBg: 'rgba(67, 135, 128, 0.05)',
+        paraText: '#1f423e'
+      },
+      dark: {
+        accent: '#6ab0a8',
+        accentText: '#8ccac2',
+        accentStrong: '#a8dcd5',
+        accentSoft: 'rgba(106, 176, 168, 0.16)',
+        badgeBorder: 'rgba(106, 176, 168, 0.32)',
+        paraBorder: 'rgba(106, 176, 168, 0.55)',
+        paraBg: 'rgba(106, 176, 168, 0.08)',
+        paraText: '#d4eae6'
+      }
+    },
+    {
+      id: 'sage',
+      label: '豆绿',
+      title: '莫兰迪豆绿',
+      swatch: '#688f74',
+      light: {
+        accent: '#5c8368',
+        accentText: '#43694f',
+        accentStrong: '#34553f',
+        accentSoft: 'rgba(92, 131, 104, 0.12)',
+        badgeBorder: 'rgba(92, 131, 104, 0.28)',
+        paraBorder: 'rgba(92, 131, 104, 0.48)',
+        paraBg: 'rgba(92, 131, 104, 0.05)',
+        paraText: '#263d2d'
+      },
+      dark: {
+        accent: '#84ab90',
+        accentText: '#a1c4ab',
+        accentStrong: '#bad7c2',
+        accentSoft: 'rgba(132, 171, 144, 0.16)',
+        badgeBorder: 'rgba(132, 171, 144, 0.32)',
+        paraBorder: 'rgba(132, 171, 144, 0.55)',
+        paraBg: 'rgba(132, 171, 144, 0.08)',
+        paraText: '#d8e8dc'
+      }
+    },
+    {
+      id: 'mist_blue',
+      label: '雾蓝',
+      title: '莫兰迪雾霾蓝',
+      swatch: '#5d829c',
+      light: {
+        accent: '#527792',
+        accentText: '#3b5f79',
+        accentStrong: '#2d4c63',
+        accentSoft: 'rgba(82, 119, 146, 0.12)',
+        badgeBorder: 'rgba(82, 119, 146, 0.28)',
+        paraBorder: 'rgba(82, 119, 146, 0.48)',
+        paraBg: 'rgba(82, 119, 146, 0.05)',
+        paraText: '#223849'
+      },
+      dark: {
+        accent: '#7ba0bb',
+        accentText: '#9abbd3',
+        accentStrong: '#b5d0e4',
+        accentSoft: 'rgba(123, 160, 187, 0.16)',
+        badgeBorder: 'rgba(123, 160, 187, 0.32)',
+        paraBorder: 'rgba(123, 160, 187, 0.55)',
+        paraBg: 'rgba(123, 160, 187, 0.08)',
+        paraText: '#d6e5f0'
+      }
+    },
+    {
+      id: 'dusty_rose',
+      label: '烟粉',
+      title: '莫兰迪烟灰粉',
+      swatch: '#a86f7b',
+      light: {
+        accent: '#9c6370',
+        accentText: '#824b58',
+        accentStrong: '#6b3a46',
+        accentSoft: 'rgba(156, 99, 112, 0.12)',
+        badgeBorder: 'rgba(156, 99, 112, 0.28)',
+        paraBorder: 'rgba(156, 99, 112, 0.46)',
+        paraBg: 'rgba(156, 99, 112, 0.048)',
+        paraText: '#4a2830'
+      },
+      dark: {
+        accent: '#c48b97',
+        accentText: '#dbaab4',
+        accentStrong: '#ebc3cb',
+        accentSoft: 'rgba(196, 139, 151, 0.16)',
+        badgeBorder: 'rgba(196, 139, 151, 0.32)',
+        paraBorder: 'rgba(196, 139, 151, 0.54)',
+        paraBg: 'rgba(196, 139, 151, 0.08)',
+        paraText: '#eed9de'
+      }
+    },
+    {
+      id: 'taro_mauve',
+      label: '灰紫',
+      title: '莫兰迪香芋灰紫',
+      swatch: '#807399',
+      light: {
+        accent: '#75688f',
+        accentText: '#5d5077',
+        accentStrong: '#4a3e62',
+        accentSoft: 'rgba(117, 104, 143, 0.12)',
+        badgeBorder: 'rgba(117, 104, 143, 0.28)',
+        paraBorder: 'rgba(117, 104, 143, 0.48)',
+        paraBg: 'rgba(117, 104, 143, 0.05)',
+        paraText: '#352c47'
+      },
+      dark: {
+        accent: '#9d90b8',
+        accentText: '#b8add0',
+        accentStrong: '#cfc6e3',
+        accentSoft: 'rgba(157, 144, 184, 0.16)',
+        badgeBorder: 'rgba(157, 144, 184, 0.32)',
+        paraBorder: 'rgba(157, 144, 184, 0.55)',
+        paraBg: 'rgba(157, 144, 184, 0.08)',
+        paraText: '#e2dced'
+      }
+    },
+    {
+      id: 'warm_ochre',
+      label: '暖咖',
+      title: '莫兰迪燕麦暖咖',
+      swatch: '#9b7c5e',
+      light: {
+        accent: '#8f7053',
+        accentText: '#74573c',
+        accentStrong: '#5d442d',
+        accentSoft: 'rgba(143, 112, 83, 0.12)',
+        badgeBorder: 'rgba(143, 112, 83, 0.28)',
+        paraBorder: 'rgba(143, 112, 83, 0.46)',
+        paraBg: 'rgba(143, 112, 83, 0.05)',
+        paraText: '#443221'
+      },
+      dark: {
+        accent: '#ba9b7c',
+        accentText: '#d2b79c',
+        accentStrong: '#e4ceb8',
+        accentSoft: 'rgba(186, 155, 124, 0.16)',
+        badgeBorder: 'rgba(186, 155, 124, 0.32)',
+        paraBorder: 'rgba(186, 155, 124, 0.54)',
+        paraBg: 'rgba(186, 155, 124, 0.08)',
+        paraText: '#ede0d3'
+      }
+    }
+  ];
 
   const SUPPORTED_LANGUAGES = [
     { value: '简体中文', label: '简体中文 (Simplified Chinese)' },
@@ -90,8 +250,23 @@
     displayMode: 'bilingual',
     model: DEFAULT_MODEL,
     autoExpandHeight: true,
-    pretranslateCollapsed: false
+    pretranslateCollapsed: false,
+    colorTheme: DEFAULT_COLOR_THEME
   };
+
+  const VALID_COLOR_THEME_IDS = new Set(COLOR_THEMES.map(item => item.id));
+
+  function getColorThemeTokens(themeId, isDark = false) {
+    const preset = COLOR_THEMES.find(item => item.id === themeId) || COLOR_THEMES[0];
+    const palette = isDark ? preset.dark : preset.light;
+    return {
+      id: preset.id,
+      label: preset.label,
+      title: preset.title,
+      swatch: preset.swatch,
+      ...palette
+    };
+  }
 
   function normalizeSettings(raw) {
     const src = raw && typeof raw === 'object' ? raw : {};
@@ -112,6 +287,8 @@
     const model = typeof src.model === 'string' && /^[a-z0-9][a-z0-9._:-]{1,95}$/i.test(src.model.trim())
       ? src.model.trim()
       : DEFAULT_MODEL;
+    const rawColorTheme = typeof src.colorTheme === 'string' ? src.colorTheme.trim() : '';
+    const colorTheme = VALID_COLOR_THEME_IDS.has(rawColorTheme) ? rawColorTheme : DEFAULT_COLOR_THEME;
 
     return {
       enabled: src.enabled !== false,
@@ -120,7 +297,8 @@
       displayMode,
       model,
       autoExpandHeight: src.autoExpandHeight !== false,
-      pretranslateCollapsed: src.pretranslateCollapsed === true
+      pretranslateCollapsed: src.pretranslateCollapsed === true,
+      colorTheme
     };
   }
 
@@ -1023,11 +1201,14 @@
   return {
     PLUGIN_VERSION,
     DEFAULT_MODEL,
+    DEFAULT_COLOR_THEME,
+    COLOR_THEMES,
     CUSTOM_LANG_VALUE,
     BATCH_ITEM_PREFIX,
     SUPPORTED_LANGUAGES,
     FALLBACK_MODELS,
     DEFAULT_SETTINGS,
+    getColorThemeTokens,
     normalizeSettings,
     getEffectiveTargetLang,
     normalizeThinkingText,

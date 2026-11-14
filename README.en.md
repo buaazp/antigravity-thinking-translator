@@ -16,6 +16,11 @@ In Google Antigravity 2.x, reasoning models emit their internal `Thinking` strea
   - **On-demand collapsed block saving**: `pretranslateCollapsed` (**`预译未展开的折叠思考`**) defaults to `false` so unread collapsed blocks do not consume tokens in the background unless explicitly enabled or opened.
 - **Paragraph-level interleaved streaming**: Inserts translated paragraphs directly beneath each corresponding original paragraph (while preserving code blocks untouched) with jitter-free `requestAnimationFrame` token fade-in rendering.
 - **Cascading model + thinking-level selector**: First choose the model family (e.g., `Gemini 4 Hydrogen`, `Gemini 3.8 Flash`, `Claude Sonnet 5.5`), then choose the effort level dynamically filtered for that model (defaults to `Gemini 4 Hydrogen` + `Medium`).
+- **Zero-footprint disabled mode & hover-dwell regional manual translate (v0.4.0)**:
+  - Turning off the primary **`自动翻译思考过程`** toggle restores the chat UI to **100% vanilla Antigravity**: no translated titles, no right-side translation status pills, and no translation boxes injected into expanded thinking details.
+  - Hovering and dwelling (`~0.4s`) over any collapsible thinking/group header (`Thinking`, `Thought for Xs`, `Worked for ...`, `Explored ...`) reveals a subtle floating **`翻译`** button on the right; clicking it manually translates **both the titles and thinking details inside that region** while leaving all other regions untouched.
+- **Customizable Morandi color themes (v0.4.0)**:
+  - Replaces fixed accents with configurable Morandi palettes (Light & Dark tuned) across titles, translation blocks, streaming carets, badges, and settings controls — defaulting to **Celadon Teal (`青绿`)** alongside **Sage (`豆绿`)**, **Mist Blue (`雾蓝`)**, **Dusty Rose (`烟粉`)**, **Taro Mauve (`灰紫`)**, and **Warm Ochre (`暖咖`)**.
 - **Two display modes & multi-language support**:
   - **Bilingual (`显示原文和译文`)**: Shows each translated paragraph and title inline alongside its English source.
   - **Translation Only (`只显示译文`)**: Swaps each English paragraph (and non-interactive title) out cleanly once its translation begins streaming, with per-block buttons to toggle back to bilingual view, re-translate, or copy.

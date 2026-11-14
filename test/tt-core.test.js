@@ -4,13 +4,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const core = require('../tt-core');
 
-test('normalizeSettings preserves defaults and supports custom language & modes', () => {
+test('normalizeSettings preserves defaults and supports custom language, modes & Morandi colorTheme', () => {
   const def = core.normalizeSettings({});
   assert.equal(def.enabled, true);
   assert.equal(def.pretranslateCollapsed, false);
   assert.equal(def.targetLang, '简体中文');
   assert.equal(def.displayMode, 'bilingual');
   assert.equal(def.model, 'gemini-4-hydrogen-medium');
+  assert.equal(def.colorTheme, 'celadon');
   assert.equal(core.getEffectiveTargetLang(def), '简体中文');
 
   const customPreset = core.normalizeSettings({
@@ -19,17 +20,43 @@ test('normalizeSettings preserves defaults and supports custom language & modes'
     displayMode: 'translation_only',
     model: 'gemini-4-carbon-medium',
     enabled: false,
-    pretranslateCollapsed: true
+    pretranslateCollapsed: true,
+    colorTheme: 'mist_blue'
   });
   assert.equal(customPreset.enabled, false);
   assert.equal(customPreset.pretranslateCollapsed, true);
   assert.equal(customPreset.displayMode, 'translation_only');
+  assert.equal(customPreset.colorTheme, 'mist_blue');
   assert.equal(core.getEffectiveTargetLang(customPreset), '粤语');
+
+  const invalidThemeFallback = core.normalizeSettings({ colorTheme: 'neon_pink' });
+  assert.equal(invalidThemeFallback.colorTheme, 'celadon');
 
   const directForeign = core.normalizeSettings({ targetLang: 'Svenska' });
   assert.equal(directForeign.targetLang, '__custom__');
   assert.equal(directForeign.customTargetLang, 'Svenska');
   assert.equal(core.getEffectiveTargetLang(directForeign), 'Svenska');
+});
+
+test('Morandi color themes default to celadon and expose distinct light/dark tokens', () => {
+  assert.equal(core.DEFAULT_COLOR_THEME, 'celadon');
+  const ids = core.COLOR_THEMES.map(item => item.id);
+  assert.deepEqual(ids, ['celadon', 'sage', 'mist_blue', 'dusty_rose', 'taro_mauve', 'warm_ochre']);
+
+  for (const id of ids) {
+    const light = core.getColorThemeTokens(id, false);
+    const dark = core.getColorThemeTokens(id, true);
+    assert.equal(light.id, id);
+    assert.equal(dark.id, id);
+    assert.ok(/^#[0-9a-f]{6}$/i.test(light.accent));
+    assert.ok(/^#[0-9a-f]{6}$/i.test(dark.accent));
+    assert.notEqual(light.accent, dark.accent);
+    assert.ok(light.paraBg.startsWith('rgba('));
+    assert.ok(dark.paraText.startsWith('#'));
+  }
+
+  const fallback = core.getColorThemeTokens('unknown-theme', false);
+  assert.equal(fallback.id, 'celadon');
 });
 
 test('computeCacheKey is deterministic and distinguishes text, language, and model', () => {
