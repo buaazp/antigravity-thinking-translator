@@ -21,18 +21,59 @@ const {
   computeCacheKey,
   computeCanonicalCacheKey,
   buildTranslationPrompt,
+  buildBatchTranslationPrompt,
   cleanModelTranslationOutput,
+  parseBatchTranslationStream,
   parseAgyModelsOutput
 } = require('./tt-core');
 
-const MAX_CACHE_ENTRIES = 500;
-const WORKER_MAX_TURNS = 10;
+const MAX_CACHE_ENTRIES = 2000;
+const WORKER_MAX_TURNS = 24;
+const WORKER_MAX_CHARS = 28000;
 const WORKER_IDLE_MS = 8 * 60 * 1000;
 const TURN_TIMEOUT_MS = 90 * 1000;
 const MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 const LONG_TEXT_THRESHOLD = 5500;
 const CHUNK_MAX_CHARS = 4200;
-const DEFAULT_MAX_CONCURRENCY = 4;
+const DEFAULT_MAX_CONCURRENCY = 2;
+const MAX_BATCH_ITEMS = 12;
+const MAX_BATCH_CHARS = 4500;
+const CUSTOM_TRANSLATOR_AGENT_NAME = 'tt-translator';
+
+function prepareIsolatedWorkerDir(prefix) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const agentsDir = path.join(tmpDir, '.agents');
+  const translatorAgentDir = path.join(agentsDir, 'agents', CUSTOM_TRANSLATOR_AGENT_NAME);
+  fs.mkdirSync(translatorAgentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentsDir, 'skills.json'), '{"entries":[]}\n', 'utf8');
+  fs.writeFileSync(path.join(agentsDir, 'plugins.json'), '{"entries":[]}\n', 'utf8');
+  fs.writeFileSync(
+    path.join(translatorAgentDir, 'agent.md'),
+    [
+      '---',
+      `name: ${CUSTOM_TRANSLATOR_AGENT_NAME}`,
+      'description: Pure text translation engine without tools.',
+      'tools: []',
+      'mainAgent: true',
+      'subagent: false',
+      'commandExecutionPolicy: off',
+      'mcpServers: []',
+      'skills: []',
+      'plugins: []',
+      '---',
+      'You are a faithful technical translator. Follow the user prompt instructions strictly, never invoke tools, and output only the requested translation.',
+      ''
+    ].join('\n'),
+    'utf8'
+  );
+  const settingsPath = path.join(tmpDir, 'worker-settings.json');
+  fs.writeFileSync(
+    settingsPath,
+    '{"historySize":0,"notifications":false,"showTips":false,"showFeedbackSurvey":false,"disableSlashCommands":true}\n',
+    'utf8'
+  );
+  return { tmpDir, settingsPath, agentName: CUSTOM_TRANSLATOR_AGENT_NAME };
+}
 
 function buildAugmentedPath() {
   const home = process.env.USERPROFILE || os.homedir();
@@ -245,7 +286,7 @@ class TranslationCache {
     };
   }
 
-  set(key, value) {
+  set(key, value, options = {}) {
     this._ensureLoaded();
     const canonicalKey = value.canonicalKey || '';
     if (canonicalKey) {
@@ -268,7 +309,15 @@ class TranslationCache {
       this.canonicalIndex.set(canonicalKey, key);
     }
     this._prune();
-    this._save();
+    if (!options.deferSave) {
+      this._save();
+    }
+  }
+
+  flush() {
+    if (this._loaded) {
+      this._save();
+    }
   }
 
   clear() {
@@ -410,7 +459,10 @@ class WarmAgyWorker {
     this.child = null;
     this.rl = null;
     this.tmpDir = null;
+    this.settingsPath = null;
     this.turns = 0;
+    this.totalPromptChars = 0;
+    this.lastTargetLang = null;
     this.busy = false;
     this.closing = false;
     this.activeTurn = null;
@@ -425,7 +477,8 @@ class WarmAgyWorker {
       !this.child.killed &&
       this.child.exitCode === null &&
       this.model === targetModel &&
-      this.turns < WORKER_MAX_TURNS
+      this.turns < WORKER_MAX_TURNS &&
+      this.totalPromptChars < WORKER_MAX_CHARS
     );
   }
 
@@ -438,10 +491,14 @@ class WarmAgyWorker {
   }
 
   _spawn() {
-    this.tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-tt-worker-'));
+    const iso = prepareIsolatedWorkerDir('ag-tt-worker-');
+    this.tmpDir = iso.tmpDir;
+    this.settingsPath = iso.settingsPath;
     const args = [
       '--model', this.model,
+      '--agent', iso.agentName,
       '--disable-slash-commands',
+      '--settings', this.settingsPath,
       ...(this.sandbox ? ['--sandbox'] : []),
       '--input-format', 'stream-json',
       '--output-format', 'stream-json'
@@ -485,9 +542,12 @@ class WarmAgyWorker {
         clearTimeout(turn.timer);
         const r = obj.result || {};
         if (r.status === 'SUCCESS') {
+          const finalResp = String(r.response || turn.accumulated || '');
           this.turns++;
+          this.totalPromptChars += (turn.promptLen || 0) + finalResp.length;
+          if (turn.targetLang) this.lastTargetLang = turn.targetLang;
           this._resetIdleTimer();
-          turn.resolve(String(r.response || turn.accumulated || ''));
+          turn.resolve(finalResp);
         } else {
           turn.reject(new Error(r.error || `agy stream-json returned status=${r.status || 'ERROR'}`));
         }
@@ -517,11 +577,12 @@ class WarmAgyWorker {
     }
   }
 
-  runTurn(prompt, onDelta) {
+  runTurn(prompt, onDelta, meta = {}) {
     if (this.closing) return Promise.reject(new Error('Worker is closing'));
     if (!this.child) this._spawn();
     if (this.activeTurn) return Promise.reject(new Error('Worker is busy'));
 
+    const promptStr = String(prompt || '');
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.activeTurn && !this.activeTurn.settled) {
@@ -537,13 +598,15 @@ class WarmAgyWorker {
       this.activeTurn = {
         settled: false,
         accumulated: '',
+        promptLen: promptStr.length,
+        targetLang: meta?.targetLang || null,
         onDelta,
         timer,
         resolve,
         reject
       };
 
-      const payload = JSON.stringify({ event: 'user', message: { content: prompt } }) + '\n';
+      const payload = JSON.stringify({ event: 'user', message: { content: promptStr } }) + '\n';
       try {
         this.child.stdin.write(payload);
       } catch (err) {
@@ -562,6 +625,7 @@ class WarmAgyWorker {
       try { this.rl.close(); } catch {}
       this.rl = null;
     }
+    this.settingsPath = null;
     if (this.tmpDir) {
       const dir = this.tmpDir;
       this.tmpDir = null;
@@ -603,10 +667,19 @@ class AgyTranslationService {
     if (idx !== -1) this.workers.splice(idx, 1);
   }
 
+  _isWorkerRetired(w) {
+    return (
+      w.closing ||
+      (w.child && (w.child.killed || w.child.exitCode !== null)) ||
+      w.turns >= WORKER_MAX_TURNS ||
+      w.totalPromptChars >= WORKER_MAX_CHARS
+    );
+  }
+
   _cleanupDeadWorkers() {
     for (let i = this.workers.length - 1; i >= 0; i--) {
       const w = this.workers[i];
-      if (!w.busy && (w.closing || (w.child && (w.child.killed || w.child.exitCode !== null)) || w.turns >= WORKER_MAX_TURNS)) {
+      if (!w.busy && this._isWorkerRetired(w)) {
         this.workers.splice(i, 1);
         try { w.close(); } catch {}
       }
@@ -656,7 +729,7 @@ class AgyTranslationService {
   _releaseWorker(worker) {
     if (!worker) return;
     worker.busy = false;
-    if (this.disposed || worker.closing || (worker.child && (worker.child.killed || worker.child.exitCode !== null)) || worker.turns >= WORKER_MAX_TURNS) {
+    if (this.disposed || this._isWorkerRetired(worker)) {
       this._removeWorker(worker);
       try { worker.close(); } catch {}
     }
@@ -665,17 +738,19 @@ class AgyTranslationService {
   }
 
   async _runOneShot(agyPath, model, prompt) {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-tt-oneshot-'));
+    const iso = prepareIsolatedWorkerDir('ag-tt-oneshot-');
     try {
       const args = [
         '--model', model,
+        '--agent', iso.agentName,
         '--disable-slash-commands',
+        '--settings', iso.settingsPath,
         ...(this.sandbox ? ['--sandbox'] : []),
         '--output-format', 'json',
         `-p=${prompt}`
       ];
       const res = await runCommandAsync(agyPath, args, {
-        cwd: tmpDir,
+        cwd: iso.tmpDir,
         timeoutMs: this.turnTimeoutMs
       });
       if (!res.ok) {
@@ -692,30 +767,120 @@ class AgyTranslationService {
       }
       return String(parsed.response || '');
     } finally {
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(iso.tmpDir, { recursive: true, force: true }); } catch {}
     }
   }
 
-  async _translateSingleChunk(agyPath, model, targetLang, chunkText, onChunkDelta) {
-    const prompt = buildTranslationPrompt(chunkText, targetLang);
+  async _runWorkerPromptWithFallback(agyPath, model, { buildPrompt, onDelta, targetLang }) {
     const worker = await this._acquireWorker(agyPath, model);
     try {
+      const useCompact = worker.turns > 0 && Boolean(targetLang) && worker.lastTargetLang === targetLang;
+      const workerPrompt = buildPrompt({ compact: useCompact });
       try {
-        const raw = await worker.runTurn(prompt, onChunkDelta);
-        return cleanModelTranslationOutput(raw, chunkText);
+        return await worker.runTurn(workerPrompt, onDelta, { targetLang });
       } catch (err) {
         this._removeWorker(worker);
         try { worker.close(); } catch {}
         // One-shot fallback for models or environments where stream-json fails
-        const raw = await this._runOneShot(agyPath, model, prompt);
-        if (typeof onChunkDelta === 'function') {
-          try { onChunkDelta(raw, raw); } catch {}
+        const fullPrompt = buildPrompt({ compact: false });
+        const raw = await this._runOneShot(agyPath, model, fullPrompt);
+        if (typeof onDelta === 'function') {
+          try { onDelta(raw, raw); } catch {}
         }
-        return cleanModelTranslationOutput(raw, chunkText);
+        return raw;
       }
     } finally {
       this._releaseWorker(worker);
     }
+  }
+
+  async _translateSingleChunk(agyPath, model, targetLang, chunkText, onChunkDelta) {
+    const raw = await this._runWorkerPromptWithFallback(agyPath, model, {
+      targetLang,
+      buildPrompt: opts => buildTranslationPrompt(chunkText, targetLang, opts),
+      onDelta: onChunkDelta
+    });
+    return cleanModelTranslationOutput(raw, chunkText);
+  }
+
+  async _translateBatchChunk(agyPath, model, targetLang, batchEntries, onBatchUpdate) {
+    if (batchEntries.length === 1) {
+      const only = batchEntries[0];
+      const translated = await this._translateSingleChunk(agyPath, model, targetLang, only.text, partial => {
+        if (typeof onBatchUpdate === 'function') {
+          const cleaned = cleanModelTranslationOutput(partial, only.text);
+          if (cleaned) {
+            onBatchUpdate({ completed: {}, activeIndex: 0, activePartialText: cleaned });
+          }
+        }
+      });
+      return [translated];
+    }
+
+    const sourceTexts = batchEntries.map(e => e.text);
+    const raw = await this._runWorkerPromptWithFallback(agyPath, model, {
+      targetLang,
+      buildPrompt: opts => buildBatchTranslationPrompt(sourceTexts, targetLang, opts),
+      onDelta: accumulated => {
+        if (typeof onBatchUpdate === 'function') {
+          const parsed = parseBatchTranslationStream(accumulated, sourceTexts.length, sourceTexts, false);
+          onBatchUpdate(parsed);
+        }
+      }
+    });
+
+    const finalParsed = parseBatchTranslationStream(raw, sourceTexts.length, sourceTexts, true);
+    const outputs = new Array(sourceTexts.length);
+    for (let idx = 0; idx < sourceTexts.length; idx++) {
+      const cand = finalParsed.completed[idx];
+      if (typeof cand === 'string' && cand.trim()) {
+        outputs[idx] = cand.trim();
+      } else {
+        // Recover any missing item cleanly without dropping batch members
+        outputs[idx] = await this._translateSingleChunk(agyPath, model, targetLang, sourceTexts[idx], null);
+      }
+    }
+    return outputs;
+  }
+
+  async _executeChunkedTranslation(agyPath, model, targetLang, text, cacheKey, canonicalKey, listeners) {
+    const chunks = splitLongText(text, CHUNK_MAX_CHARS);
+    const translatedChunks = [];
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const prefix = translatedChunks.length ? translatedChunks.join('\n\n') + '\n\n' : '';
+      const translated = await this._translateSingleChunk(agyPath, model, targetLang, chunk, partial => {
+        const cleanedPartial = cleanModelTranslationOutput(partial, chunk);
+        const fullPartial = prefix + cleanedPartial;
+        for (const cb of listeners) {
+          try { cb({ cacheKey, canonicalKey, text: fullPartial, chunkIndex: i, totalChunks: chunks.length }); } catch {}
+        }
+      });
+      translatedChunks.push(translated);
+      const progressText = translatedChunks.join('\n\n');
+      for (const cb of listeners) {
+        try { cb({ cacheKey, canonicalKey, text: progressText, chunkIndex: i, totalChunks: chunks.length }); } catch {}
+      }
+    }
+
+    const finalTranslation = translatedChunks.join('\n\n').trim();
+    this.cache.set(cacheKey, {
+      canonicalKey,
+      translation: finalTranslation,
+      targetLang,
+      model
+    });
+
+    return {
+      ok: true,
+      cacheKey,
+      canonicalKey,
+      translation: finalTranslation,
+      model,
+      targetLang,
+      cached: false
+    };
   }
 
   checkCache(request = {}) {
@@ -773,45 +938,15 @@ class AgyTranslationService {
       return { ok: false, cacheKey, canonicalKey, error: agy.error };
     }
 
-    const promise = (async () => {
-      const chunks = splitLongText(text, CHUNK_MAX_CHARS);
-      const translatedChunks = [];
-
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const prefix = translatedChunks.length ? translatedChunks.join('\n\n') + '\n\n' : '';
-        const translated = await this._translateSingleChunk(agy.agyPath, model, targetLang, chunk, partial => {
-          const cleanedPartial = cleanModelTranslationOutput(partial, chunk);
-          const fullPartial = prefix + cleanedPartial;
-          for (const cb of listeners) {
-            try { cb({ cacheKey, canonicalKey, text: fullPartial, chunkIndex: i, totalChunks: chunks.length }); } catch {}
-          }
-        });
-        translatedChunks.push(translated);
-        const progressText = translatedChunks.join('\n\n');
-        for (const cb of listeners) {
-          try { cb({ cacheKey, canonicalKey, text: progressText, chunkIndex: i, totalChunks: chunks.length }); } catch {}
-        }
-      }
-
-      const finalTranslation = translatedChunks.join('\n\n').trim();
-      this.cache.set(cacheKey, {
-        canonicalKey,
-        translation: finalTranslation,
-        targetLang,
-        model
-      });
-
-      return {
-        ok: true,
-        cacheKey,
-        canonicalKey,
-        translation: finalTranslation,
-        model,
-        targetLang,
-        cached: false
-      };
-    })().catch(err => ({
+    const promise = this._executeChunkedTranslation(
+      agy.agyPath,
+      model,
+      targetLang,
+      text,
+      cacheKey,
+      canonicalKey,
+      listeners
+    ).catch(err => ({
       ok: false,
       cacheKey,
       canonicalKey,
@@ -822,6 +957,287 @@ class AgyTranslationService {
 
     this.inflight.set(inflightKey, { promise, listeners });
     return promise;
+  }
+
+  async translateBatch(request = {}) {
+    if (this.disposed) {
+      return { ok: false, error: 'Translation service has been disposed', results: {} };
+    }
+
+    const rawItems = Array.isArray(request.items) ? request.items : [];
+    const currentSettings = getSettings({ stateDir: this.stateDir }).settings;
+    const targetLang = String(request.targetLang || getEffectiveTargetLang(currentSettings)).trim() || '简体中文';
+    const model = String(request.model || currentSettings.model || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+    const force = request.force === true;
+    const onItemProgress = typeof request.onItemProgress === 'function' ? request.onItemProgress : null;
+    const emitItem = payload => {
+      if (!onItemProgress) return;
+      try { onItemProgress(payload); } catch {}
+    };
+
+    const results = {};
+    const inflightWaiters = [];
+    const groupsByKey = new Map();
+
+    for (const item of rawItems) {
+      const id = item && typeof item.id === 'string' ? item.id : '';
+      const norm = normalizeThinkingText(item?.text || '');
+      if (!id || !norm) continue;
+
+      const cacheKey = computeCacheKey(norm, targetLang, model);
+      const canonicalKey = computeCanonicalCacheKey(norm, targetLang, model);
+
+      if (!force) {
+        const cached = this.cache.lookup(norm, targetLang, model);
+        if (cached) {
+          results[id] = {
+            ok: true,
+            cacheKey,
+            canonicalKey,
+            translation: cached.translation,
+            model,
+            targetLang,
+            cached: true
+          };
+          emitItem({ id, text: cached.translation, done: true, cached: true });
+          continue;
+        }
+      }
+
+      let group = groupsByKey.get(canonicalKey);
+      if (!group && !force && this.inflight.has(canonicalKey)) {
+        const existing = this.inflight.get(canonicalKey);
+        const relayIds = [id];
+        const listener = prog => {
+          if (prog && typeof prog.text === 'string') {
+            for (const rid of relayIds) {
+              emitItem({ id: rid, text: prog.text, done: false, cached: false });
+            }
+          }
+        };
+        existing.listeners.add(listener);
+        inflightWaiters.push(
+          existing.promise.then(res => {
+            existing.listeners.delete(listener);
+            for (const rid of relayIds) {
+              results[rid] = res;
+              if (res?.ok && typeof res.translation === 'string') {
+                emitItem({ id: rid, text: res.translation, done: true, cached: Boolean(res.cached) });
+              }
+            }
+          })
+        );
+        // Track relayIds in case duplicate items appear later in the same request
+        groupsByKey.set(`relay:${canonicalKey}`, { relayIds });
+        continue;
+      }
+
+      const existingRelay = groupsByKey.get(`relay:${canonicalKey}`);
+      if (!group && existingRelay) {
+        existingRelay.relayIds.push(id);
+        continue;
+      }
+
+      if (!group) {
+        group = {
+          text: norm,
+          cacheKey,
+          canonicalKey,
+          ids: [id],
+          inflightKey: force ? `force:${cacheKey}:${Date.now()}:${Math.random()}` : canonicalKey,
+          listeners: new Set(),
+          resolveDeferred: null,
+          settled: false
+        };
+        const listeners = group.listeners;
+        const p = new Promise(resolve => {
+          group.resolveDeferred = val => {
+            if (!group.settled) {
+              group.settled = true;
+              resolve(val);
+            }
+          };
+        });
+        this.inflight.set(group.inflightKey, { promise: p, listeners });
+        groupsByKey.set(canonicalKey, group);
+      } else {
+        group.ids.push(id);
+      }
+    }
+
+    const workEntries = Array.from(groupsByKey.entries())
+      .filter(([k]) => !k.startsWith('relay:'))
+      .map(([, v]) => v);
+
+    if (workEntries.length === 0) {
+      if (inflightWaiters.length > 0) await Promise.all(inflightWaiters);
+      return { ok: true, results, model, targetLang, cacheStats: this.cache.stats() };
+    }
+
+    const agy = resolveAgyExecutable(this.agyPathOverride);
+    if (!agy.ok) {
+      for (const entry of workEntries) {
+        const failRes = { ok: false, cacheKey: entry.cacheKey, canonicalKey: entry.canonicalKey, error: agy.error };
+        this.inflight.delete(entry.inflightKey);
+        entry.resolveDeferred(failRes);
+        for (const id of entry.ids) results[id] = failRes;
+      }
+      if (inflightWaiters.length > 0) await Promise.all(inflightWaiters);
+      return { ok: false, error: agy.error, results, model, targetLang, cacheStats: this.cache.stats() };
+    }
+
+    const finalizeEntrySuccess = (entry, finalText, deferSave = false) => {
+      if (entry.settled) return;
+      this.cache.set(
+        entry.cacheKey,
+        { canonicalKey: entry.canonicalKey, translation: finalText, targetLang, model },
+        { deferSave }
+      );
+      const resObj = {
+        ok: true,
+        cacheKey: entry.cacheKey,
+        canonicalKey: entry.canonicalKey,
+        translation: finalText,
+        model,
+        targetLang,
+        cached: false
+      };
+      this.inflight.delete(entry.inflightKey);
+      entry.resolveDeferred(resObj);
+      for (const id of entry.ids) {
+        results[id] = resObj;
+        emitItem({ id, text: finalText, done: true, cached: false });
+      }
+    };
+
+    const finalizeEntryError = (entry, errMsg) => {
+      if (entry.settled) return;
+      const failRes = {
+        ok: false,
+        cacheKey: entry.cacheKey,
+        canonicalKey: entry.canonicalKey,
+        error: errMsg
+      };
+      this.inflight.delete(entry.inflightKey);
+      entry.resolveDeferred(failRes);
+      for (const id of entry.ids) {
+        results[id] = failRes;
+        emitItem({ id, error: errMsg, done: true, ok: false });
+      }
+    };
+
+    const normalEntries = [];
+    const oversizeEntries = [];
+    for (const entry of workEntries) {
+      if (entry.text.length > CHUNK_MAX_CHARS) oversizeEntries.push(entry);
+      else normalEntries.push(entry);
+    }
+
+    const subBatches = [];
+    let curBatch = [];
+    let curChars = 0;
+    for (const entry of normalEntries) {
+      if (
+        curBatch.length >= MAX_BATCH_ITEMS ||
+        (curBatch.length > 0 && curChars + entry.text.length > MAX_BATCH_CHARS)
+      ) {
+        subBatches.push(curBatch);
+        curBatch = [];
+        curChars = 0;
+      }
+      curBatch.push(entry);
+      curChars += entry.text.length;
+    }
+    if (curBatch.length > 0) subBatches.push(curBatch);
+
+    const runOversize = oversizeEntries.map(async entry => {
+      const relaySet = new Set(entry.listeners);
+      relaySet.add(prog => {
+        if (prog && typeof prog.text === 'string') {
+          for (const id of entry.ids) {
+            emitItem({ id, text: prog.text, done: false, cached: false });
+          }
+        }
+      });
+      try {
+        const res = await this._executeChunkedTranslation(
+          agy.agyPath,
+          model,
+          targetLang,
+          entry.text,
+          entry.cacheKey,
+          entry.canonicalKey,
+          relaySet
+        );
+        this.inflight.delete(entry.inflightKey);
+        entry.resolveDeferred(res);
+        for (const id of entry.ids) {
+          results[id] = res;
+          emitItem({ id, text: res.translation, done: true, cached: false });
+        }
+      } catch (err) {
+        finalizeEntryError(entry, err?.message || String(err));
+      }
+    });
+
+    const runSubBatches = subBatches.map(async batch => {
+      const emittedDoneIdx = new Set();
+      try {
+        const translations = await this._translateBatchChunk(
+          agy.agyPath,
+          model,
+          targetLang,
+          batch,
+          parsed => {
+            if (!parsed) return;
+            for (const [idxStr, doneText] of Object.entries(parsed.completed || {})) {
+              const idx = Number(idxStr);
+              const entry = batch[idx];
+              if (!entry || emittedDoneIdx.has(idx) || typeof doneText !== 'string' || !doneText.trim()) continue;
+              emittedDoneIdx.add(idx);
+              for (const cb of entry.listeners) {
+                try { cb({ cacheKey: entry.cacheKey, canonicalKey: entry.canonicalKey, text: doneText, chunkIndex: 0, totalChunks: 1 }); } catch {}
+              }
+              finalizeEntrySuccess(entry, doneText.trim(), true);
+            }
+            if (Number.isInteger(parsed.activeIndex) && parsed.activeIndex >= 0 && typeof parsed.activePartialText === 'string' && parsed.activePartialText) {
+              const entry = batch[parsed.activeIndex];
+              if (entry && !emittedDoneIdx.has(parsed.activeIndex)) {
+                for (const cb of entry.listeners) {
+                  try { cb({ cacheKey: entry.cacheKey, canonicalKey: entry.canonicalKey, text: parsed.activePartialText, chunkIndex: 0, totalChunks: 1 }); } catch {}
+                }
+                for (const id of entry.ids) {
+                  emitItem({ id, text: parsed.activePartialText, done: false, cached: false });
+                }
+              }
+            }
+          }
+        );
+
+        for (let idx = 0; idx < batch.length; idx++) {
+          const entry = batch[idx];
+          if (entry && !entry.settled) {
+            finalizeEntrySuccess(entry, String(translations[idx] || '').trim(), true);
+          }
+        }
+      } catch (err) {
+        const msg = err?.message || String(err);
+        for (const entry of batch) {
+          finalizeEntryError(entry, msg);
+        }
+      }
+    });
+
+    await Promise.all([...runSubBatches, ...runOversize, ...inflightWaiters]);
+    this.cache.flush();
+
+    return {
+      ok: true,
+      results,
+      model,
+      targetLang,
+      cacheStats: this.cache.stats()
+    };
   }
 
   dispose() {

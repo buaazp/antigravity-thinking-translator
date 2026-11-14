@@ -7,6 +7,7 @@ const core = require('../tt-core');
 test('normalizeSettings preserves defaults and supports custom language & modes', () => {
   const def = core.normalizeSettings({});
   assert.equal(def.enabled, true);
+  assert.equal(def.pretranslateCollapsed, false);
   assert.equal(def.targetLang, '简体中文');
   assert.equal(def.displayMode, 'bilingual');
   assert.equal(def.model, 'gemini-4-hydrogen-medium');
@@ -17,9 +18,11 @@ test('normalizeSettings preserves defaults and supports custom language & modes'
     customTargetLang: '粤语',
     displayMode: 'translation_only',
     model: 'gemini-4-carbon-medium',
-    enabled: false
+    enabled: false,
+    pretranslateCollapsed: true
   });
   assert.equal(customPreset.enabled, false);
+  assert.equal(customPreset.pretranslateCollapsed, true);
   assert.equal(customPreset.displayMode, 'translation_only');
   assert.equal(core.getEffectiveTargetLang(customPreset), '粤语');
 
@@ -173,4 +176,73 @@ test('renderStreamingMarkdownHtml safely adds token fade span and streaming care
 
   const finalHtml = core.renderStreamingMarkdownHtml('正在分析代码库', 4, false);
   assert.ok(!finalHtml.includes('ag-tt-stream-caret'));
+});
+
+test('translateBoilerplateTitle translates standard headers/status locally and leaves prose for LLM', () => {
+  assert.equal(core.translateBoilerplateTitle('Thinking', '简体中文'), '思考中');
+  assert.equal(core.translateBoilerplateTitle('Thinking for 5s', '简体中文'), '思考中 (5s)');
+  assert.equal(core.translateBoilerplateTitle('Thought for 14s', '简体中文'), '思考了 14s');
+  assert.equal(core.translateBoilerplateTitle('Thought Process', '简体中文'), '思考过程');
+  assert.equal(core.translateBoilerplateTitle('Worked for 1m 20s', '简体中文'), '已执行 1m 20s');
+  assert.equal(core.translateBoilerplateTitle('Checked command status', '简体中文'), '已检查命令状态');
+  assert.equal(core.translateBoilerplateTitle('Waiting for your approval', '简体中文'), '等待你的确认');
+  assert.equal(core.translateBoilerplateTitle('Analyzed package.json', '简体中文'), '已分析 package.json');
+  assert.equal(core.translateBoilerplateTitle('Edited tt-core.js +12 -3', '简体中文'), '已编辑 tt-core.js +12 -3');
+  assert.equal(core.translateBoilerplateTitle('Explored', '简体中文'), '已探索');
+  assert.equal(core.translateBoilerplateTitle('Explored tt-backend.js', '简体中文'), '已探索 tt-backend.js');
+  assert.equal(core.translateBoilerplateTitle('Explored, ran commands', '简体中文'), '已探索，已运行命令');
+  assert.equal(
+    core.translateBoilerplateTitle('Explored 3 files, ran 2 commands, edited tt-core.js', '简体中文'),
+    '已探索 3 个文件，已运行 2 条命令，已编辑 tt-core.js'
+  );
+  assert.equal(core.translateBoilerplateTitle('Thought for 14s', '日本語'), '14s 思考');
+  assert.equal(core.translateBoilerplateTitle('Thought for 14s', '한국어'), '14s 동안 사고함');
+
+  // Free-form English titles & non-file words must return null for LLM batch translation
+  assert.equal(core.translateBoilerplateTitle('Ran check workspace and Rust toolchain', '简体中文'), null);
+  assert.equal(core.translateBoilerplateTitle('Test traceroute permissions and behavior on macOS finished', '简体中文'), null);
+  assert.equal(core.translateBoilerplateTitle('Analyzed architecture', '简体中文'), null);
+});
+
+test('shouldTranslateTitle distinguishes English step titles from bare paths, flags, and target language', () => {
+  assert.equal(core.shouldTranslateTitle('Ran check workspace and Rust toolchain', '简体中文'), true);
+  assert.equal(core.shouldTranslateTitle('Working', '简体中文'), true);
+  assert.equal(core.shouldTranslateTitle('src/renderer/main.js', '简体中文'), false);
+  assert.equal(core.shouldTranslateTitle('--sandbox', '简体中文'), false);
+  assert.equal(core.shouldTranslateTitle('v0.3.0', '简体中文'), false);
+  assert.equal(core.shouldTranslateTitle('SOCK_DGRAM', '简体中文'), false);
+  assert.equal(core.shouldTranslateTitle('已运行检查工作区', '简体中文'), false);
+});
+
+test('buildTranslationPrompt supports compact warm-worker mode and batch prompt/stream parsing works incrementally', () => {
+  const full = core.buildTranslationPrompt('Hello world', '简体中文', { compact: false });
+  const compact = core.buildTranslationPrompt('Hello world', '简体中文', { compact: true });
+  assert.ok(compact.length < full.length);
+  assert.ok(compact.includes('<SOURCE_THINKING_TEXT>'));
+
+  const batchPrompt = core.buildBatchTranslationPrompt(['First step', 'Second step'], '简体中文', { compact: false });
+  assert.ok(batchPrompt.includes('<SOURCE_BATCH>'));
+  assert.ok(batchPrompt.includes('<<<AG_TT_ITEM_0>>>'));
+  assert.ok(batchPrompt.includes('<<<AG_TT_ITEM_1>>>'));
+
+  // Streaming mid-marker split should not leak partial marker characters
+  const partial1 = core.parseBatchTranslationStream('<<<AG_TT_ITEM_0>>>\n第一步\n<<<AG_TT_IT', 2, ['First step', 'Second step'], false);
+  assert.deepEqual(partial1.completed, {});
+  assert.equal(partial1.activeIndex, 0);
+  assert.equal(partial1.activePartialText, '第一步');
+
+  // Arrival of item 1 completes item 0 and streams item 1
+  const partial2 = core.parseBatchTranslationStream('<<<AG_TT_ITEM_0>>>\n第一步\n<<<AG_TT_ITEM_1>>>\n第二', 2, ['First step', 'Second step'], false);
+  assert.deepEqual(partial2.completed, { 0: '第一步' });
+  assert.equal(partial2.activeIndex, 1);
+  assert.equal(partial2.activePartialText, '第二');
+
+  // Final pass completes last item
+  const finalParsed = core.parseBatchTranslationStream('<<<AG_TT_ITEM_0>>>\n第一步\n<<<AG_TT_ITEM_1>>>\n第二步', 2, ['First step', 'Second step'], true);
+  assert.deepEqual(finalParsed.completed, { 0: '第一步', 1: '第二步' });
+  assert.equal(finalParsed.activeIndex, -1);
+
+  // Single-item batch tolerates markerless model response
+  const singleFallback = core.parseBatchTranslationStream('唯一条目译文', 1, ['Only item'], true);
+  assert.deepEqual(singleFallback.completed, { 0: '唯一条目译文' });
 });

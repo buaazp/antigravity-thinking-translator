@@ -7,15 +7,19 @@ In Google Antigravity 2.x, reasoning models emit their internal `Thinking` strea
 ## Features
 
 - **Zero impact on reasoning quality**: Prompts, rules, and backend calls are untouched. Models continue thinking in English while translations stream asynchronously paragraph by paragraph on the client.
-- **Paragraph-level interleaved streaming & background pre-translation**:
-  - Inserts translated paragraphs directly beneath each corresponding original paragraph (while preserving code blocks untouched).
-  - Translates completed paragraphs immediately during live thinking and pre-translates collapsed/tool-grouped thinking blocks in the background so expanding them is instant.
-  - Pooled persistent `agy` workers (up to 4 concurrent workers) translate paragraphs in parallel with jitter-free `requestAnimationFrame` token fade-in rendering.
+- **Priority-0 thinking header & step title translation**:
+  - Translates collapsible group headers (`Thinking`, `Thought for Xs`, `Worked for ...`, `Explored ...`) and step titles (`Ran ...`, `... finished`, `Edited ...`, etc.) **first** ahead of body paragraphs, so you can decide at a glance whether a step needs expanding.
+  - Standard status headers and single-file actions use **0ms / 0-token local boilerplate translation**, while free-form English titles are coalesced into streaming batches (`translateBatch`).
+- **Low-token & high-performance worker engine (v0.3.0)**:
+  - **Isolated tool-free translator agent**: Spawns workers in temporary isolated directories with a dedicated custom agent (`--agent tt-translator` with `tools: []`, `mcpServers: []`, `skills: []`, `plugins: []`, `commandExecutionPolicy: off`) plus session-only `--settings` (`historySize: 0`, `notifications: false`, `showTips: false`, `showFeedbackSurvey: false`, `disableSlashCommands: true`), avoiding workspace MCP servers, skills loading, or session context bloat.
+  - **Streaming batching & compact warm turns**: Coalesces up to 12 items into a single streaming `translateBatch` turn, uses compact continuation prompts across up to 24 turns (28,000 chars) per warm worker, caps default concurrency at `2` workers, and stores up to `2,000` formatting-agnostic canonical LRU cache entries.
+  - **On-demand collapsed block saving**: `pretranslateCollapsed` (**`预译未展开的折叠思考`**) defaults to `false` so unread collapsed blocks do not consume tokens in the background unless explicitly enabled or opened.
+- **Paragraph-level interleaved streaming**: Inserts translated paragraphs directly beneath each corresponding original paragraph (while preserving code blocks untouched) with jitter-free `requestAnimationFrame` token fade-in rendering.
 - **Cascading model + thinking-level selector**: First choose the model family (e.g., `Gemini 4 Hydrogen`, `Gemini 3.8 Flash`, `Claude Sonnet 5.5`), then choose the effort level dynamically filtered for that model (defaults to `Gemini 4 Hydrogen` + `Medium`).
-- **Two display modes**:
-  - **Bilingual (`显示原文和译文`)**: Shows each translated paragraph inline below its English source paragraph.
-  - **Translation Only (`只显示译文`)**: Swaps each English paragraph out cleanly once its translation begins streaming, with per-block buttons to toggle back to bilingual view, re-translate, or copy.
-- **Configurable target language & canonical LRU cache**: Supports preset & custom target languages, and indexes cache entries with formatting-agnostic canonical keys so background pre-translations match DOM blocks seamlessly.
+- **Two display modes & multi-language support**:
+  - **Bilingual (`显示原文和译文`)**: Shows each translated paragraph and title inline alongside its English source.
+  - **Translation Only (`只显示译文`)**: Swaps each English paragraph (and non-interactive title) out cleanly once its translation begins streaming, with per-block buttons to toggle back to bilingual view, re-translate, or copy.
+  - Supports preset & custom target languages.
 - **Coexists with `antigravity-context-viewer`**: Uses isolated `tt-*` files and paired injection markers so both plugins can be installed, updated, and restored independently.
 
 ## Quick Start

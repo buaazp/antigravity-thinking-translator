@@ -24,6 +24,8 @@
     groupModelsForCascade,
     resolveCascadeSelection,
     shouldTranslateText,
+    shouldTranslateTitle,
+    translateBoilerplateTitle,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
     escapeHtml
@@ -33,9 +35,11 @@
   const HOST_ID = 'ag-thinking-translator';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
-  const MAX_ACTIVE_REQUESTS = 4;
-  const MAX_BG_REQUESTS = 2;
-  const SCHEDULER_DEQUEUE_SCAN_MS = 10;
+  const MAX_CONCURRENT_BATCH_REQUESTS = 2;
+  const TITLE_COALESCE_MS = 30;
+  const PARA_COALESCE_MS = 45;
+  const CLIENT_BATCH_MAX_ITEMS = 12;
+  const CLIENT_BATCH_MAX_CHARS = 4200;
   const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
@@ -47,7 +51,10 @@
   let activeTranslations = 0;
   let lastErrorMsg = '';
   let scanTimer = 0;
+  let titleSyncRaf = 0;
   let pollTimer = 0;
+  let batchFlushTimer = 0;
+  let batchFlushAt = 0;
   let rafId = 0;
   let lastAnimTick = 0;
   let themeObserver = null;
@@ -58,9 +65,10 @@
   let reqSeq = 0;
   let initialScanDone = false;
 
-  // Wrapper & paragraph state tracking
+  // Wrapper, title & paragraph state tracking
   const blockStates = new WeakMap();
   const trackedWrappers = new Set();
+  const titleStates = new Map(); // containerEl -> TitleEntry
   const seenToolGroups = new WeakMap(); // buttonEl -> last thinking fingerprint
   const historicalToolGroups = new WeakSet();
   const toolGroupStates = new WeakMap(); // buttonEl -> Array<FiberBlockState>
@@ -69,15 +77,15 @@
   const memCache = new Map();
   const checkedCanonMisses = new Set();
 
-  // Priority concurrent translation scheduler
-  let activeHighCount = 0;
-  let activeBgCount = 0;
+  // 3-tier coalescing batch scheduler: Priority 0 titles > Priority 1 expanded/live prose > Priority 2 bg prose
+  let activeBatchCount = 0;
+  const titleQueue = [];
   const highQueue = [];
   const bgQueue = [];
   const activeTasks = new Map(); // taskKey -> Task
 
-  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #6366f1;\n  --tt-accent-soft: rgba(99, 102, 241, 0.12);\n  --tt-accent-text: #4f46e5;\n  --tt-success: #10b981;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #818cf8;\n  --tt-accent-soft: rgba(129, 140, 248, 0.16);\n  --tt-accent-text: #a5b4fc;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-success);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.2.0</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <span class=\"tt-label-inline\">自动翻译思考过程</span>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
+  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #6366f1;\n  --tt-accent-soft: rgba(99, 102, 241, 0.12);\n  --tt-accent-text: #4f46e5;\n  --tt-success: #10b981;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #818cf8;\n  --tt-accent-soft: rgba(129, 140, 248, 0.16);\n  --tt-accent-text: #a5b4fc;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-success);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.3.0</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <span class=\"tt-label-inline\">自动翻译思考过程</span>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -132,6 +140,52 @@
     return res.json();
   }
 
+  async function consumeNdjsonPost(route, payload, onLine) {
+    const live = getLiveInfo();
+    if (!live || !live.port || !live.token) {
+      throw new Error('翻译后端桥接未连接');
+    }
+    const res = await fetch(`http://127.0.0.1:${live.port}${route}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-AG-TT-Token': live.token
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(`翻译请求失败 (HTTP ${res.status})`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let finalRes = null;
+
+    const handleLine = raw => {
+      const t = raw.trim();
+      if (!t) return;
+      let obj;
+      try { obj = JSON.parse(t); } catch { return; }
+      if (obj.event === 'result') {
+        finalRes = obj.result;
+      } else if (typeof onLine === 'function') {
+        onLine(obj);
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) handleLine(line);
+    }
+    if (buf.trim()) handleLine(buf);
+    return finalRes || { ok: false, error: '未收到翻译结果' };
+  }
+
   async function callTranslate(payload, onProgress) {
     const ipc = getIpcApi();
     if (ipc && typeof ipc.translate === 'function') {
@@ -151,52 +205,59 @@
       }
     }
 
-    const live = getLiveInfo();
-    if (!live || !live.port || !live.token) {
-      throw new Error('翻译后端桥接未连接');
-    }
-    const res = await fetch(`http://127.0.0.1:${live.port}/translate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-AG-TT-Token': live.token
-      },
-      body: JSON.stringify(payload)
+    return consumeNdjsonPost('/translate', payload, obj => {
+      if (obj.event === 'progress' && typeof onProgress === 'function') {
+        onProgress(obj);
+      }
     });
-    if (!res.ok || !res.body) {
-      throw new Error(`翻译请求失败 (HTTP ${res.status})`);
-    }
+  }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let finalRes = null;
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t) continue;
-        let obj;
-        try { obj = JSON.parse(t); } catch { continue; }
-        if (obj.event === 'progress' && typeof onProgress === 'function') {
-          onProgress(obj);
-        } else if (obj.event === 'result') {
-          finalRes = obj.result;
-        }
+  async function callTranslateBatch(payload, onItemProgress) {
+    const ipc = getIpcApi();
+    if (ipc && typeof ipc.translateBatch === 'function') {
+      const requestId = `ttb-${Date.now()}-${++reqSeq}`;
+      let unsubscribe = null;
+      if (typeof ipc.onProgress === 'function') {
+        unsubscribe = ipc.onProgress(ev => {
+          if (ev && ev.requestId === requestId && ev.event === 'item_progress' && typeof onItemProgress === 'function') {
+            onItemProgress(ev);
+          }
+        });
+      }
+      try {
+        return await ipc.translateBatch({ ...payload, requestId });
+      } finally {
+        try { unsubscribe?.(); } catch {}
       }
     }
-    if (buf.trim()) {
-      try {
-        const obj = JSON.parse(buf.trim());
-        if (obj.event === 'result') finalRes = obj.result;
-      } catch {}
+
+    const live = getLiveInfo();
+    if (live && live.port && live.token) {
+      return consumeNdjsonPost('/translate-batch', payload, obj => {
+        if (obj.event === 'item_progress' && typeof onItemProgress === 'function') {
+          onItemProgress(obj);
+        }
+      });
     }
-    return finalRes || { ok: false, error: '未收到翻译结果' };
+
+    // Legacy single-item fallback if older preload lacks translateBatch
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const results = {};
+    for (const item of items) {
+      const res = await callTranslate(
+        { text: item.text, targetLang: payload.targetLang, model: payload.model, force: payload.force },
+        prog => {
+          if (prog && typeof prog.text === 'string' && typeof onItemProgress === 'function') {
+            onItemProgress({ id: item.id, text: prog.text, done: false, cached: false });
+          }
+        }
+      );
+      results[item.id] = res;
+      if (res?.ok && typeof res.translation === 'string' && typeof onItemProgress === 'function') {
+        onItemProgress({ id: item.id, text: res.translation, done: true, cached: Boolean(res.cached) });
+      }
+    }
+    return { ok: true, results };
   }
 
   // =========================================================================
@@ -209,6 +270,69 @@
     styleEl.textContent = `
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"][data-ag-tt-active="1"] > button[data-testid="thinking-collapsible-trigger"] + div.overflow-y-auto {
         max-height: 360px !important;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-has-badge="1"] > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 92px;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-has-tools="1"] > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 196px;
+      }
+      [data-ag-tt-title-mode="translation_only"] > [data-ag-tt-title-ready="1"] {
+        display: none !important;
+      }
+      .ag-tt-header-title-trans,
+      .ag-tt-step-title-trans {
+        overflow-anchor: none;
+        font-size: inherit;
+        line-height: 1.35;
+        min-width: 0;
+        word-break: break-word;
+        transition: opacity 120ms ease;
+      }
+      [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
+      [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans {
+        color: #6366f1;
+        opacity: 0.92;
+      }
+      [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans::before,
+      [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans::before {
+        content: "· ";
+        opacity: 0.55;
+      }
+      html.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
+      html.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans,
+      body.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
+      body.dark [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans,
+      [data-theme="dark"] [data-ag-tt-title-mode="bilingual"] > .ag-tt-header-title-trans,
+      [data-theme="dark"] [data-ag-tt-title-mode="bilingual"] > .ag-tt-step-title-trans {
+        color: #a5b4fc;
+      }
+      [data-ag-tt-title-mode="translation_only"] > .ag-tt-header-title-trans,
+      [data-ag-tt-title-mode="translation_only"] > .ag-tt-step-title-trans {
+        color: inherit;
+        opacity: 0.88;
+      }
+      [data-ag-tt-title-mode="translation_only"][data-ag-tt-title-interactive="1"] > .ag-tt-header-title-trans::before,
+      [data-ag-tt-title-mode="translation_only"][data-ag-tt-title-interactive="1"] > .ag-tt-step-title-trans::before {
+        content: "· ";
+        opacity: 0.55;
+      }
+      [data-ag-tt-title-slot="1"] {
+        flex-wrap: wrap;
+        row-gap: 1px;
+        column-gap: 5px;
+      }
+      [data-ag-tt-title-slot="1"] > :first-child {
+        min-width: 0;
+        max-width: 100%;
+      }
+      button[data-ag-tt-header-wrap="1"] {
+        flex-wrap: wrap;
+        row-gap: 1px;
+      }
+      .ag-tt-title-pending {
+        opacity: 0.52;
+        font-size: 0.92em;
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] [data-markdown-root] > [data-ag-tt-orig-ready="1"],
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="translation_only"] .ag-tt-fallback-root > [data-ag-tt-orig-ready="1"] {
@@ -500,6 +624,8 @@
     if (el('tt-version')) el('tt-version').textContent = `v${PLUGIN_VERSION}`;
     const enabledInput = el('tt-enabled');
     if (enabledInput) enabledInput.checked = Boolean(settings.enabled);
+    const pretranslateInput = el('tt-pretranslate-collapsed');
+    if (pretranslateInput) pretranslateInput.checked = Boolean(settings.pretranslateCollapsed);
 
     const langSelect = el('tt-target-lang');
     if (langSelect) {
@@ -562,13 +688,47 @@
     }
   }
 
+  function clearQueuedTasks() {
+    if (batchFlushTimer) {
+      clearTimeout(batchFlushTimer);
+      batchFlushTimer = 0;
+      batchFlushAt = 0;
+    }
+    for (const q of [titleQueue, highQueue, bgQueue]) {
+      while (q.length) {
+        const task = q.shift();
+        if (task && !task.running) {
+          task.cancelled = true;
+          activeTasks.delete(task.taskKey);
+        }
+      }
+    }
+  }
+
   function resetAllTranslationStates(clearMem = false) {
     if (clearMem) {
       memCache.clear();
       checkedCanonMisses.clear();
     }
-    highQueue.length = 0;
-    bgQueue.length = 0;
+    clearQueuedTasks();
+
+    for (const [containerEl, entry] of Array.from(titleStates.entries())) {
+      if (!containerEl.isConnected) {
+        titleStates.delete(containerEl);
+        continue;
+      }
+      entry.status = 'idle';
+      entry.targetText = '';
+      entry.canonKey = '';
+      entry.error = '';
+      entry.fromCache = false;
+      if (entry.origEl?.isConnected) entry.origEl.removeAttribute('data-ag-tt-title-ready');
+      if (entry.transEl?.isConnected) entry.transEl.remove();
+      containerEl.removeAttribute('data-ag-tt-title-mode');
+      containerEl.removeAttribute('data-ag-tt-title-interactive');
+      containerEl.removeAttribute('data-ag-tt-header-wrap');
+      titleStates.delete(containerEl);
+    }
 
     for (const wrapper of Array.from(trackedWrappers)) {
       if (!wrapper.isConnected) {
@@ -578,6 +738,7 @@
       const st = blockStates.get(wrapper);
       if (!st) continue;
       st.fiberBlocks = [];
+      st.hasStartedTranslation = false;
       for (const p of st.domParas.values()) {
         p.status = 'idle';
         p.targetText = '';
@@ -595,9 +756,13 @@
   }
 
   async function persistSettings(partial) {
+    const prevEnabled = settings.enabled;
     const prevLang = getEffectiveTargetLang(settings);
     const prevModel = settings.model;
     settings = normalizeSettings({ ...settings, ...partial });
+    if (prevEnabled && !settings.enabled) {
+      clearQueuedTasks();
+    }
     renderSettingsUI();
 
     try {
@@ -622,6 +787,9 @@
         }
         const st = blockStates.get(wrapper);
         if (st) syncWrapperModeAndOrigVisibility(wrapper, st);
+      }
+      for (const entry of titleStates.values()) {
+        if (entry?.containerEl?.isConnected) syncTitleEntryUI(entry);
       }
     }
 
@@ -748,6 +916,7 @@
       st = {
         seenOnInitialScan: false,
         wasStreaming: false,
+        hasStartedTranslation: false,
         autoTranslateOnExpand: false,
         forceTranslateOnExpand: false,
         localViewMode: null,
@@ -763,87 +932,183 @@
   }
 
   // =========================================================================
-  // Priority Concurrent Translation Scheduler (Foreground <=4, Background <=2)
+  // 3-Tier Coalescing Batch Scheduler (Priority 0 Titles > Expanded > Bg)
   // =========================================================================
-  function dispatchSchedulerQueue() {
+  const PRIORITY_RANK = { title: 0, high: 1, bg: 2 };
+
+  function getQueueByPriority(priority) {
+    if (priority === 'title') return titleQueue;
+    if (priority === 'high') return highQueue;
+    return bgQueue;
+  }
+
+  function scheduleBatchFlush(delayMs) {
+    if (disposed) return;
+    const wait = Math.max(0, Number(delayMs) || 0);
+    const targetAt = Date.now() + wait;
+    if (batchFlushTimer) {
+      if (targetAt + 4 >= batchFlushAt) return;
+      clearTimeout(batchFlushTimer);
+      batchFlushTimer = 0;
+    }
+    batchFlushAt = targetAt;
+    batchFlushTimer = setTimeout(() => {
+      batchFlushTimer = 0;
+      batchFlushAt = 0;
+      flushSchedulerBatches();
+    }, wait);
+  }
+
+  function popNextCoalescedBatch() {
+    const orderedQueues = [titleQueue, highQueue, bgQueue];
+    for (const queue of orderedQueues) {
+      while (queue.length > 0 && (queue[0].done || queue[0].cancelled)) {
+        queue.shift();
+      }
+      if (!queue.length) continue;
+
+      const first = queue.shift();
+      const batch = [first];
+      let totalChars = first.text.length;
+
+      // Keep oversize single items standalone so they chunk cleanly; otherwise pack matching tasks
+      if (totalChars <= CLIENT_BATCH_MAX_CHARS) {
+        let idx = 0;
+        while (idx < queue.length && batch.length < CLIENT_BATCH_MAX_ITEMS) {
+          const cand = queue[idx];
+          if (!cand || cand.done || cand.cancelled) {
+            queue.splice(idx, 1);
+            continue;
+          }
+          if (cand.targetLang === first.targetLang && cand.model === first.model && cand.force === first.force) {
+            if (cand.text.length <= CLIENT_BATCH_MAX_CHARS && totalChars + cand.text.length <= CLIENT_BATCH_MAX_CHARS) {
+              queue.splice(idx, 1);
+              batch.push(cand);
+              totalChars += cand.text.length;
+              continue;
+            }
+          }
+          idx++;
+        }
+      }
+      return batch;
+    }
+    return null;
+  }
+
+  function flushSchedulerBatches() {
     if (disposed) return;
 
-    while (activeHighCount + activeBgCount < MAX_ACTIVE_REQUESTS) {
-      let picked = null;
-      let lane = null;
-
-      if (highQueue.length > 0) {
-        picked = highQueue.shift();
-        lane = 'high';
-      } else if (bgQueue.length > 0 && activeBgCount < MAX_BG_REQUESTS) {
-        picked = bgQueue.shift();
-        lane = 'bg';
-      } else {
-        break;
-      }
-
-      if (!picked || picked.done || picked.cancelled) continue;
-      runScheduledTask(picked, lane);
+    while (activeBatchCount < MAX_CONCURRENT_BATCH_REQUESTS) {
+      const batch = popNextCoalescedBatch();
+      if (!batch || !batch.length) break;
+      runScheduledBatch(batch);
     }
   }
 
-  function runScheduledTask(task, lane) {
-    task.lane = lane;
-    task.running = true;
-    if (lane === 'high') activeHighCount++;
-    else activeBgCount++;
-    activeTranslations = activeHighCount + activeBgCount;
+  function runScheduledBatch(batch) {
+    activeBatchCount++;
+    activeTranslations += batch.length;
+    const first = batch[0];
+    const taskById = new Map();
+
+    for (const task of batch) {
+      task.running = true;
+      task.settled = false;
+      taskById.set(task.taskKey, task);
+      for (const sub of task.subscribers) {
+        sub.onStart?.();
+      }
+    }
     renderSettingsUI();
 
-    for (const sub of task.subscribers) {
-      sub.onStart?.();
-    }
-
-    void callTranslate(
-      { text: task.text, targetLang: task.targetLang, model: task.model, force: task.force },
+    void callTranslateBatch(
+      {
+        items: batch.map(t => ({ id: t.taskKey, text: t.text })),
+        targetLang: first.targetLang,
+        model: first.model,
+        force: first.force
+      },
       prog => {
-        if (disposed || !prog || typeof prog.text !== 'string') return;
-        task.lastPartial = prog.text;
-        for (const sub of task.subscribers) {
-          sub.onProgress?.(prog.text);
+        if (disposed || !prog || !prog.id) return;
+        const task = taskById.get(prog.id);
+        if (!task || task.settled) return;
+
+        if (prog.done) {
+          task.settled = true;
+          if (prog.ok === false || typeof prog.text !== 'string') {
+            const errMsg = prog.error || '翻译失败';
+            lastErrorMsg = errMsg;
+            for (const sub of task.subscribers) {
+              sub.onError?.(errMsg);
+            }
+            return;
+          }
+          if (!prog.cached) cacheCount++;
+          memCache.set(task.canonKey, prog.text);
+          checkedCanonMisses.delete(task.canonKey);
+          for (const sub of task.subscribers) {
+            sub.onDone?.(prog.text, Boolean(prog.cached));
+          }
+        } else if (typeof prog.text === 'string') {
+          task.lastPartial = prog.text;
+          for (const sub of task.subscribers) {
+            sub.onProgress?.(prog.text);
+          }
         }
       }
     ).then(res => {
       if (disposed) return;
-      if (res && res.ok && typeof res.translation === 'string') {
-        if (!res.cached) cacheCount++;
-        memCache.set(task.canonKey, res.translation);
-        checkedCanonMisses.delete(task.canonKey);
-        for (const sub of task.subscribers) {
-          sub.onDone?.(res.translation, Boolean(res.cached));
-        }
-      } else {
-        const errMsg = res?.error || '翻译失败';
-        lastErrorMsg = errMsg;
-        for (const sub of task.subscribers) {
-          sub.onError?.(errMsg);
+      if (res?.cacheStats && typeof res.cacheStats.count === 'number') {
+        cacheCount = res.cacheStats.count;
+      }
+      for (const task of batch) {
+        if (task.settled) continue;
+        task.settled = true;
+        const itemRes = res?.results?.[task.taskKey];
+        if (itemRes && itemRes.ok && typeof itemRes.translation === 'string') {
+          if (!itemRes.cached && !res?.cacheStats) cacheCount++;
+          memCache.set(task.canonKey, itemRes.translation);
+          checkedCanonMisses.delete(task.canonKey);
+          for (const sub of task.subscribers) {
+            sub.onDone?.(itemRes.translation, Boolean(itemRes.cached));
+          }
+        } else {
+          const errMsg = itemRes?.error || res?.error || '翻译失败';
+          lastErrorMsg = errMsg;
+          for (const sub of task.subscribers) {
+            sub.onError?.(errMsg);
+          }
         }
       }
     }).catch(err => {
       if (disposed) return;
       const errMsg = err?.message || String(err);
       lastErrorMsg = errMsg;
-      for (const sub of task.subscribers) {
-        sub.onError?.(errMsg);
+      for (const task of batch) {
+        if (task.settled) continue;
+        task.settled = true;
+        for (const sub of task.subscribers) {
+          sub.onError?.(errMsg);
+        }
       }
     }).finally(() => {
-      task.done = true;
-      task.running = false;
-      activeTasks.delete(task.taskKey);
-      if (task.lane === 'high') activeHighCount = Math.max(0, activeHighCount - 1);
-      else activeBgCount = Math.max(0, activeBgCount - 1);
-      activeTranslations = activeHighCount + activeBgCount;
+      for (const task of batch) {
+        task.done = true;
+        task.running = false;
+        activeTasks.delete(task.taskKey);
+      }
+      activeBatchCount = Math.max(0, activeBatchCount - 1);
+      activeTranslations = Math.max(0, activeTranslations - batch.length);
       renderSettingsUI();
-      setTimeout(dispatchSchedulerQueue, SCHEDULER_DEQUEUE_SCAN_MS);
+      if (!disposed && (titleQueue.length || highQueue.length || bgQueue.length)) {
+        const nextDelay = titleQueue.length ? 8 : 12;
+        scheduleBatchFlush(nextDelay);
+      }
     });
   }
 
-  function scheduleParagraphTranslation({ text, targetLang, model, force = false, priority = 'high', subscriber }) {
+  function enqueueTranslationTask({ text, targetLang, model, force = false, priority = 'high', subscriber }) {
     const canonKey = computeCanonicalCacheKey(text, targetLang, model);
     if (!force && memCache.has(canonKey)) {
       const hit = memCache.get(canonKey);
@@ -852,10 +1117,10 @@
     }
 
     const taskKey = force ? `force:${canonKey}:${++reqSeq}` : canonKey;
-    let task = activeTasks.get(canonKey);
+    const existing = force ? null : activeTasks.get(canonKey);
 
-    if (force || !task) {
-      task = {
+    if (!existing) {
+      const task = {
         taskKey,
         canonKey,
         text,
@@ -864,29 +1129,31 @@
         force,
         priority,
         running: false,
+        settled: false,
         done: false,
         cancelled: false,
         lastPartial: '',
         subscribers: new Set([subscriber])
       };
       activeTasks.set(taskKey, task);
-      if (priority === 'high') highQueue.push(task);
-      else bgQueue.push(task);
-      dispatchSchedulerQueue();
+      getQueueByPriority(priority).push(task);
+      scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
       return;
     }
 
-    // Attach to existing inflight/queued task and upgrade priority if requested
-    task.subscribers.add(subscriber);
-    if (task.running) {
+    // Attach to existing inflight/queued task and upgrade priority lane if needed
+    existing.subscribers.add(subscriber);
+    if (existing.running) {
       subscriber.onStart?.();
-      if (task.lastPartial) subscriber.onProgress?.(task.lastPartial);
-    } else if (priority === 'high' && task.priority === 'bg') {
-      task.priority = 'high';
-      const idx = bgQueue.indexOf(task);
-      if (idx !== -1) bgQueue.splice(idx, 1);
-      if (!highQueue.includes(task)) highQueue.push(task);
-      dispatchSchedulerQueue();
+      if (existing.lastPartial) subscriber.onProgress?.(existing.lastPartial);
+    } else if (PRIORITY_RANK[priority] < PRIORITY_RANK[existing.priority]) {
+      const oldQueue = getQueueByPriority(existing.priority);
+      const idx = oldQueue.indexOf(existing);
+      if (idx !== -1) oldQueue.splice(idx, 1);
+      existing.priority = priority;
+      const newQueue = getQueueByPriority(priority);
+      if (!newQueue.includes(existing)) newQueue.push(existing);
+      scheduleBatchFlush(priority === 'title' ? TITLE_COALESCE_MS : PARA_COALESCE_MS);
     }
   }
 
@@ -1135,6 +1402,9 @@
         const cur = getEffectiveWrapperMode(st);
         st.localViewMode = cur === 'translation_only' ? 'bilingual' : 'translation_only';
         syncWrapperModeAndOrigVisibility(wrapper, st);
+        for (const entry of titleStates.values()) {
+          if (entry && entry.wrapperSt === st) syncTitleEntryUI(entry);
+        }
       });
 
       const retranslateBtn = document.createElement('button');
@@ -1237,6 +1507,10 @@
 
     const visible = settings.enabled || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0;
     bar.style.display = visible ? 'inline-flex' : 'none';
+    if (visible) wrapper.setAttribute('data-ag-tt-has-badge', '1');
+    else wrapper.removeAttribute('data-ag-tt-has-badge');
+    if (visible && showTools) wrapper.setAttribute('data-ag-tt-has-tools', '1');
+    else wrapper.removeAttribute('data-ag-tt-has-tools');
   }
 
   function collectWrapperTranslationText(st) {
@@ -1255,10 +1529,360 @@
   }
 
   // =========================================================================
-  // Per-Paragraph & Background Translation Orchestration
+  // Per-Paragraph, Header/Step Title (Priority 0) & Background Orchestration
   // =========================================================================
+  const ICON_LIGATURE_CLASS_RE = /(?:^|\s)(?:material-symbols[^\s]*|material-icons[^\s]*|codicon[^\s]*)(?=\s|$)/;
+  const GAP_FLEX_CLASS_RE = /(?:^|\s)gap-(?:x-)?(?:\d|px|\[)/;
+
+  function readVisibleDomText(node, skipSelector = '') {
+    if (!node) return '';
+    if (node.nodeType === 3) return node.nodeValue || '';
+    if (node.nodeType !== 1) return '';
+    if (
+      node.tagName === 'SVG' ||
+      node.tagName === 'STYLE' ||
+      node.tagName === 'SCRIPT' ||
+      node.tagName === 'NOSCRIPT'
+    ) {
+      return '';
+    }
+    if (
+      node.hasAttribute('data-ag-tt-ui') ||
+      node.hasAttribute('data-ag-tt-para') ||
+      node.hasAttribute('data-slot-out') ||
+      node.getAttribute('aria-hidden') === 'true'
+    ) {
+      return '';
+    }
+    const cls = typeof node.className === 'string' ? node.className : '';
+    if (cls && ICON_LIGATURE_CLASS_RE.test(cls)) return '';
+    if (skipSelector && node.matches?.(skipSelector)) return '';
+
+    const parts = [];
+    for (const child of node.childNodes) {
+      const txt = readVisibleDomText(child, skipSelector);
+      if (txt) parts.push(txt);
+    }
+    if (!parts.length) return '';
+
+    const isHorizontalGapFlex = /\bflex\b/.test(cls) && !/\bflex-col\b/.test(cls) && GAP_FLEX_CLASS_RE.test(cls);
+    if (isHorizontalGapFlex) {
+      return parts.map(s => s.trim()).filter(Boolean).join(' ');
+    }
+    return parts.join('');
+  }
+
+  function extractCleanTitleInfo(origEl) {
+    const fullText = readVisibleDomText(origEl, '').replace(/\s+/g, ' ').trim();
+    const hasCodeEl = Boolean(origEl.querySelector?.('.font-mono, code, pre'));
+    let isRawCodeFallback = false;
+    if (hasCodeEl) {
+      const nonCode = readVisibleDomText(origEl, '.font-mono, code, pre')
+        .replace(/\b(?:Run|Running|Ran|Waiting|Canceled|Cancelled|Rejected)\b/gi, ' ')
+        .replace(/·?\s*Exited with code\s*-?\d+/gi, ' ')
+        .replace(/[?·—-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!/[A-Za-z]{3,}/.test(nonCode)) {
+        isRawCodeFallback = true;
+      }
+    }
+    const hasInteractiveChip = Boolean(
+      origEl.querySelector?.('a, button, [role="button"], .cursor-pointer, [data-tooltip-id]')
+    );
+    return { fullText, isRawCodeFallback, hasInteractiveChip };
+  }
+
+  function syncTitleEntryUI(entry) {
+    const { containerEl, origEl, transEl, targetText, status, isRawCodeFallback, hasInteractiveChip, wrapperSt } = entry;
+    if (!containerEl?.isConnected || !origEl?.isConnected || !transEl?.isConnected) return;
+
+    const mode = wrapperSt ? getEffectiveWrapperMode(wrapperSt) : settings.displayMode;
+    containerEl.setAttribute('data-ag-tt-title-mode', mode);
+    if (hasInteractiveChip) containerEl.setAttribute('data-ag-tt-title-interactive', '1');
+    else containerEl.removeAttribute('data-ag-tt-title-interactive');
+
+    const liveText = readVisibleDomText(origEl, '').replace(/\s+/g, ' ').trim();
+    const isStaleText = Boolean(entry.text && liveText && liveText !== entry.text);
+    const allowDisplay = Boolean(settings.enabled || entry.manualRequested || entry.wrapperSt?.hasStartedTranslation);
+    const canShow = allowDisplay && !isStaleText && status !== 'skipped' && !isRawCodeFallback;
+    if (!canShow) {
+      origEl.removeAttribute('data-ag-tt-title-ready');
+      transEl.style.display = 'none';
+      transEl.textContent = '';
+      containerEl.removeAttribute('data-ag-tt-header-wrap');
+      return;
+    }
+
+    if (targetText) {
+      transEl.style.display = '';
+      transEl.classList.remove('ag-tt-title-pending');
+      transEl.textContent = targetText;
+      if (containerEl.tagName === 'BUTTON') {
+        containerEl.setAttribute('data-ag-tt-header-wrap', '1');
+      }
+      if (mode === 'translation_only' && !hasInteractiveChip) {
+        origEl.setAttribute('data-ag-tt-title-ready', '1');
+      } else {
+        origEl.removeAttribute('data-ag-tt-title-ready');
+      }
+    } else if (status === 'translating' || status === 'queued') {
+      origEl.removeAttribute('data-ag-tt-title-ready');
+      transEl.style.display = '';
+      transEl.classList.add('ag-tt-title-pending');
+      transEl.textContent = '译中...';
+      containerEl.removeAttribute('data-ag-tt-header-wrap');
+    } else {
+      origEl.removeAttribute('data-ag-tt-title-ready');
+      transEl.style.display = 'none';
+      transEl.textContent = '';
+      containerEl.removeAttribute('data-ag-tt-header-wrap');
+    }
+  }
+
+  function startTitleTranslation(entry, targetLang, model, force = false) {
+    const activeCanon = entry.canonKey;
+    entry.status = 'queued';
+    if (force) {
+      entry.targetText = '';
+      entry.fromCache = false;
+      entry.error = '';
+    }
+    syncTitleEntryUI(entry);
+
+    enqueueTranslationTask({
+      text: entry.text,
+      targetLang,
+      model,
+      force,
+      priority: 'title',
+      subscriber: {
+        onStart: () => {
+          if (disposed || entry.canonKey !== activeCanon || !entry.containerEl?.isConnected) return;
+          entry.status = 'translating';
+          syncTitleEntryUI(entry);
+        },
+        onProgress: partialText => {
+          if (disposed || entry.canonKey !== activeCanon || !entry.containerEl?.isConnected) return;
+          entry.status = 'translating';
+          entry.fromCache = false;
+          entry.targetText = partialText;
+          syncTitleEntryUI(entry);
+        },
+        onDone: (finalText, cached) => {
+          if (disposed || entry.canonKey !== activeCanon || !entry.containerEl?.isConnected) return;
+          entry.status = 'done';
+          entry.targetText = finalText;
+          entry.fromCache = Boolean(cached);
+          entry.error = '';
+          syncTitleEntryUI(entry);
+        },
+        onError: errMsg => {
+          if (disposed || entry.canonKey !== activeCanon || !entry.containerEl?.isConnected) return;
+          entry.status = 'error';
+          entry.error = errMsg;
+          syncTitleEntryUI(entry);
+        }
+      }
+    });
+  }
+
+  function collectTitleTargets() {
+    const targets = [];
+    const seenContainers = new Set();
+    const excludeSelector = '#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], [contenteditable="true"], [data-markdown-root], .ag-tt-fallback-root';
+
+    const headerBtns = document.querySelectorAll(
+      'button[data-testid="thinking-collapsible-trigger"], button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]'
+    );
+    for (const btn of headerBtns) {
+      if (btn.classList.contains('hidden') || btn.closest(excludeSelector)) continue;
+      const nonUi = Array.from(btn.children).filter(c => !c.hasAttribute('data-ag-tt-ui'));
+      const origEl = nonUi[0];
+      if (!origEl) continue;
+      const chevronEl = nonUi.length >= 2 ? nonUi[nonUi.length - 1] : null;
+      const isThinkingTrig = btn.getAttribute('data-testid') === 'thinking-collapsible-trigger';
+      const wrapperSt = isThinkingTrig && btn.parentElement ? getOrInitBlockState(btn.parentElement) : null;
+      seenContainers.add(btn);
+      targets.push({
+        containerEl: btn,
+        origEl,
+        insertBeforeEl: chevronEl,
+        className: 'ag-tt-header-title-trans',
+        isStepSlot: false,
+        wrapperSt
+      });
+    }
+
+    const ephNodes = document.querySelectorAll('div[data-testid="ephemeral-tool-status"]');
+    for (const div of ephNodes) {
+      if (div.closest(excludeSelector) || seenContainers.has(div)) continue;
+      const origEl = Array.from(div.children).find(c => !c.hasAttribute('data-ag-tt-ui'));
+      if (!origEl) continue;
+      seenContainers.add(div);
+      targets.push({
+        containerEl: div,
+        origEl,
+        insertBeforeEl: null,
+        className: 'ag-tt-header-title-trans',
+        isStepSlot: false,
+        wrapperSt: null
+      });
+    }
+
+    const stepRows = document.querySelectorAll('div.group.flex.w-full.min-w-0.items-center.min-h-8.select-none');
+    for (const row of stepRows) {
+      if (row.closest(excludeSelector)) continue;
+      const titleSlot = row.children[0];
+      if (!titleSlot || titleSlot.tagName !== 'DIV' || !titleSlot.classList.contains('min-w-0')) continue;
+      if (seenContainers.has(titleSlot)) continue;
+      const origEl = Array.from(titleSlot.children).find(c => !c.hasAttribute('data-ag-tt-ui'));
+      if (!origEl) continue;
+      seenContainers.add(titleSlot);
+      targets.push({
+        containerEl: titleSlot,
+        origEl,
+        insertBeforeEl: null,
+        className: 'ag-tt-step-title-trans',
+        isStepSlot: true,
+        wrapperSt: null
+      });
+    }
+
+    return targets;
+  }
+
+  function scanStepAndHeaderTitles(targetLang, model, prewarmItems, forceAll = false) {
+    for (const [containerEl] of Array.from(titleStates.entries())) {
+      if (!containerEl.isConnected) titleStates.delete(containerEl);
+    }
+
+    const targets = collectTitleTargets();
+    for (const t of targets) {
+      const { containerEl, origEl, insertBeforeEl, className, isStepSlot, wrapperSt } = t;
+      if (isStepSlot) containerEl.setAttribute('data-ag-tt-title-slot', '1');
+
+      const info = extractCleanTitleInfo(origEl);
+      let entry = titleStates.get(containerEl);
+
+      if (!entry) {
+        let transEl = Array.from(containerEl.children).find(
+          c => c.hasAttribute('data-ag-tt-ui') && (c.classList.contains('ag-tt-header-title-trans') || c.classList.contains('ag-tt-step-title-trans'))
+        );
+        if (!transEl) {
+          transEl = document.createElement('span');
+          transEl.className = className;
+          transEl.setAttribute('data-ag-tt-ui', '1');
+        }
+        entry = {
+          containerEl,
+          origEl,
+          transEl,
+          wrapperSt,
+          text: '',
+          canonKey: '',
+          isRawCodeFallback: false,
+          hasInteractiveChip: false,
+          manualRequested: false,
+          status: 'idle',
+          targetText: '',
+          fromCache: false,
+          error: ''
+        };
+        titleStates.set(containerEl, entry);
+      } else {
+        entry.origEl = origEl;
+        entry.wrapperSt = wrapperSt;
+      }
+
+      if (insertBeforeEl && insertBeforeEl.parentElement === containerEl) {
+        if (entry.transEl.parentElement !== containerEl || entry.transEl.nextElementSibling !== insertBeforeEl) {
+          containerEl.insertBefore(entry.transEl, insertBeforeEl);
+        }
+      } else if (entry.transEl.parentElement !== containerEl) {
+        containerEl.appendChild(entry.transEl);
+      }
+
+      entry.isRawCodeFallback = info.isRawCodeFallback;
+      entry.hasInteractiveChip = info.hasInteractiveChip;
+
+      if (!info.fullText) {
+        entry.text = '';
+        entry.canonKey = '';
+        entry.status = 'skipped';
+        entry.targetText = '';
+        entry.manualRequested = false;
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      const canonKey = computeCanonicalCacheKey(info.fullText, targetLang, model);
+      if (entry.canonKey !== canonKey) {
+        entry.text = info.fullText;
+        entry.canonKey = canonKey;
+        entry.status = 'idle';
+        entry.targetText = '';
+        entry.fromCache = false;
+        entry.error = '';
+        entry.manualRequested = false;
+      }
+
+      if (info.isRawCodeFallback) {
+        entry.status = 'skipped';
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      if (forceAll) {
+        entry.manualRequested = true;
+      }
+
+      const allowTitleTranslate = Boolean(settings.enabled || forceAll || entry.manualRequested || entry.wrapperSt?.hasStartedTranslation);
+      if (!allowTitleTranslate) {
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      // 0ms / 0-token local translation for standard Antigravity status headers & file chips
+      const boilerHit = translateBoilerplateTitle(info.fullText, targetLang);
+      if (boilerHit) {
+        entry.status = 'done';
+        entry.targetText = boilerHit;
+        entry.fromCache = true;
+        entry.error = '';
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      if (!shouldTranslateTitle(info.fullText, targetLang)) {
+        entry.status = 'skipped';
+        entry.targetText = '';
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      if (!forceAll && memCache.has(canonKey)) {
+        entry.status = 'done';
+        entry.targetText = memCache.get(canonKey);
+        entry.fromCache = true;
+        entry.error = '';
+        syncTitleEntryUI(entry);
+        continue;
+      }
+
+      prewarmItems.push({ text: info.fullText });
+
+      if (forceAll || (settings.enabled && entry.status === 'idle')) {
+        startTitleTranslation(entry, targetLang, model, forceAll);
+      } else {
+        syncTitleEntryUI(entry);
+      }
+    }
+  }
+
   function startDomParaTranslation(wrapper, st, p, targetLang, model, force, priority) {
     const activeCanon = p.canonKey;
+    st.hasStartedTranslation = true;
     p.status = 'queued';
     if (force) {
       p.targetText = '';
@@ -1270,7 +1894,7 @@
     renderParaTransEl(p);
     syncWrapperModeAndOrigVisibility(wrapper, st);
 
-    scheduleParagraphTranslation({
+    enqueueTranslationTask({
       text: p.text,
       targetLang,
       model,
@@ -1323,7 +1947,7 @@
     fb.status = 'queued';
     onStateChange?.();
 
-    scheduleParagraphTranslation({
+    enqueueTranslationTask({
       text: fb.text,
       targetLang,
       model,
@@ -1535,7 +2159,8 @@
       prewarmItems.push({ text });
 
       const isTrailing = i === rawBlocks.length - 1;
-      const canBgTranslate = settings.enabled && isRecentOrLive && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
+      const allowCollapsedBg = Boolean(settings.pretranslateCollapsed || st.hasStartedTranslation);
+      const canBgTranslate = settings.enabled && allowCollapsedBg && isRecentOrLive && (!streamingNow || !isTrailing || (now - fb.lastGrowthAt >= LIVE_STREAM_PAUSE_MS && text.length >= 40));
       if (canBgTranslate && fb.status === 'idle') {
         startFiberBlockTranslation(fb, targetLang, model, 'bg', () => {
           syncWrapperHeaderUI(wrapper, st);
@@ -1604,7 +2229,7 @@
           if (!entry) {
             entry = { text: blk.text, canonKey, status: 'idle', targetText: '', fromCache: false, error: '' };
           }
-          if (settings.enabled && entry.status === 'idle') {
+          if (settings.enabled && settings.pretranslateCollapsed && entry.status === 'idle') {
             startFiberBlockTranslation(entry, targetLang, model, 'bg', null);
           }
           nextList.push(entry);
@@ -1619,10 +2244,14 @@
     ensureGlobalStyles();
     dockToTitlebar();
 
-    const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
     const targetLang = getEffectiveTargetLang(settings);
     const model = settings.model || DEFAULT_MODEL;
     const prewarmItems = [];
+
+    // Priority 0: Always translate visible group headers & step titles FIRST
+    scanStepAndHeaderTitles(targetLang, model, prewarmItems, false);
+
+    const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
     const total = triggers.length;
 
     for (let idx = 0; idx < total; idx++) {
@@ -1674,6 +2303,15 @@
     if (prewarmItems.length > 0) {
       void prewarmBackendCache(prewarmItems, targetLang, model);
     }
+  }
+
+  function scheduleFastTitleSync() {
+    if (disposed || titleSyncRaf) return;
+    titleSyncRaf = requestAnimationFrame(() => {
+      titleSyncRaf = 0;
+      if (disposed) return;
+      scanStepAndHeaderTitles(getEffectiveTargetLang(settings), settings.model || DEFAULT_MODEL, [], false);
+    });
   }
 
   function scheduleScan() {
@@ -1751,6 +2389,10 @@
       void persistSettings({ enabled: ev.target.checked });
     });
 
+    el('tt-pretranslate-collapsed')?.addEventListener('change', ev => {
+      void persistSettings({ pretranslateCollapsed: ev.target.checked });
+    });
+
     el('tt-target-lang')?.addEventListener('change', ev => {
       const val = ev.target.value;
       void persistSettings({ targetLang: val });
@@ -1815,6 +2457,9 @@
     });
 
     el('tt-translate-now')?.addEventListener('click', () => {
+      const targetLang = getEffectiveTargetLang(settings);
+      const model = settings.model || DEFAULT_MODEL;
+      scanStepAndHeaderTitles(targetLang, model, [], true);
       for (const wrapper of Array.from(trackedWrappers)) {
         if (!wrapper.isConnected) continue;
         void translateWrapperNow(wrapper, false);
@@ -1874,7 +2519,10 @@
         themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme'] });
       }
       domObserver = new MutationObserver(mutations => {
-        if (!isPluginMutation(mutations)) scheduleScan();
+        if (!isPluginMutation(mutations)) {
+          scheduleFastTitleSync();
+          scheduleScan();
+        }
       });
       domObserver.observe(document.body || document.documentElement, {
         childList: true,
@@ -1896,8 +2544,11 @@
     if (disposed) return;
     disposed = true;
     if (scanTimer) clearTimeout(scanTimer);
+    if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
+    if (batchFlushTimer) clearTimeout(batchFlushTimer);
     if (rafId) cancelAnimationFrame(rafId);
+    titleQueue.length = 0;
     highQueue.length = 0;
     bgQueue.length = 0;
     try { themeObserver?.disconnect(); } catch {}
@@ -1906,11 +2557,25 @@
     if (docClickHandler) document.removeEventListener('click', docClickHandler);
     window.removeEventListener('resize', positionPopover);
 
+    for (const [containerEl, entry] of Array.from(titleStates.entries())) {
+      if (entry.origEl?.isConnected) entry.origEl.removeAttribute('data-ag-tt-title-ready');
+      if (entry.transEl?.isConnected) entry.transEl.remove();
+      if (containerEl?.isConnected) {
+        containerEl.removeAttribute('data-ag-tt-title-mode');
+        containerEl.removeAttribute('data-ag-tt-title-interactive');
+        containerEl.removeAttribute('data-ag-tt-title-slot');
+        containerEl.removeAttribute('data-ag-tt-header-wrap');
+      }
+    }
+    titleStates.clear();
+
     for (const wrapper of Array.from(trackedWrappers)) {
       if (!wrapper.isConnected) continue;
       wrapper.removeAttribute('data-ag-tt-wrapper');
       wrapper.removeAttribute('data-ag-tt-mode');
       wrapper.removeAttribute('data-ag-tt-active');
+      wrapper.removeAttribute('data-ag-tt-has-badge');
+      wrapper.removeAttribute('data-ag-tt-has-tools');
       for (const bar of wrapper.querySelectorAll(':scope > .ag-tt-trigger-bar, :scope > [data-ag-tt-ui]')) {
         bar.remove();
       }
@@ -1922,6 +2587,7 @@
       }
     }
 
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();
@@ -1937,16 +2603,21 @@
       active: !disposed && Boolean(host.isConnected),
       version: PLUGIN_VERSION,
       enabled: settings.enabled,
+      pretranslateCollapsed: settings.pretranslateCollapsed,
       targetLang: getEffectiveTargetLang(settings),
       displayMode: settings.displayMode,
       model: settings.model,
       hasIpcBridge: Boolean(getIpcApi()),
       hasLiveBridge: Boolean(getLiveInfo()),
       trackedBlocks: trackedWrappers.size,
+      trackedTitles: titleStates.size,
       activeTranslations,
       lastError: lastErrorMsg || null
     }),
     translateAllVisible: () => {
+      const targetLang = getEffectiveTargetLang(settings);
+      const model = settings.model || DEFAULT_MODEL;
+      scanStepAndHeaderTitles(targetLang, model, [], false);
       for (const w of Array.from(trackedWrappers)) {
         if (w.isConnected) void translateWrapperNow(w, false);
       }

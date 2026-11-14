@@ -168,6 +168,29 @@ function registerIpcOnce() {
       }
     });
   });
+
+  ipcMain.handle('thinking-translator:translate-batch', async (event, payload) => {
+    if (!isLocalMainFrameSender(event)) throw new Error('Unauthorized sender');
+    const req = payload && typeof payload === 'object' ? payload : {};
+    const requestId = req.requestId || null;
+    return service.translateBatch({
+      items: req.items,
+      targetLang: req.targetLang,
+      model: req.model,
+      force: req.force === true,
+      onItemProgress: prog => {
+        try {
+          if (!event.sender.isDestroyed?.()) {
+            event.sender.send('thinking-translator:progress', {
+              requestId,
+              event: 'item_progress',
+              ...prog
+            });
+          }
+        } catch {}
+      }
+    });
+  });
 }
 
 function installThinkingTranslator(win) {

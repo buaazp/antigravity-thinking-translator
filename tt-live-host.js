@@ -14,7 +14,7 @@ const {
 } = require('./tt-backend');
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const ALLOWED_ROUTES = ['/get-settings', '/save-settings', '/list-models', '/check-cache', '/clear-cache', '/status', '/translate'];
+const ALLOWED_ROUTES = ['/get-settings', '/save-settings', '/list-models', '/check-cache', '/clear-cache', '/status', '/translate', '/translate-batch'];
 
 async function detectLiveOrigin() {
   const port = getDevToolsPort();
@@ -149,6 +149,30 @@ async function startLiveHost(options = {}) {
             try {
               if (!res.writableEnded) {
                 res.write(JSON.stringify({ event: 'progress', ...prog }) + '\n');
+              }
+            } catch {}
+          }
+        });
+        if (!res.writableEnded) {
+          res.write(JSON.stringify({ event: 'result', result }) + '\n');
+          res.end();
+        }
+        return;
+      }
+      if (req.url === '/translate-batch') {
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Cache-Control': 'no-cache'
+        });
+        const result = await service.translateBatch({
+          items: payload.items,
+          targetLang: payload.targetLang,
+          model: payload.model,
+          force: payload.force === true,
+          onItemProgress: prog => {
+            try {
+              if (!res.writableEnded) {
+                res.write(JSON.stringify({ event: 'item_progress', ...prog }) + '\n');
               }
             } catch {}
           }

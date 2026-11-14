@@ -188,6 +188,30 @@
   font-weight: 500;
 }
 
+.tt-row-sub {
+  margin-top: -2px;
+  margin-bottom: 10px;
+}
+
+.tt-label-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tt-row-sub .tt-label-inline {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--tt-text);
+}
+
+.tt-subhint {
+  font-size: 10.5px;
+  line-height: 1.25;
+  color: var(--tt-text-muted);
+}
+
 .tt-select,
 .tt-input {
   width: 100%;

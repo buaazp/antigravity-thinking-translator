@@ -21,6 +21,7 @@ function createMockAgyScript(dir) {
 
   const scriptBody = `
 const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 const args = process.argv.slice(2);
 const counterFile = ${JSON.stringify(counterFile)};
@@ -37,7 +38,28 @@ if (args.includes('--effort')) {
   process.exit(2);
 }
 
-fs.appendFileSync(counterFile, JSON.stringify(args) + '\\n');
+// Isolation check: --agent tt-translator + valid --settings JSON + .agents/{skills.json,plugins.json,agents/tt-translator/agent.md} in cwd
+const agentIdx = args.indexOf('--agent');
+const agentArgOk = agentIdx !== -1 && args[agentIdx + 1] === 'tt-translator';
+const settingsIdx = args.indexOf('--settings');
+const parsedSettings = settingsIdx !== -1 && fs.existsSync(args[settingsIdx + 1])
+  ? JSON.parse(fs.readFileSync(args[settingsIdx + 1], 'utf8'))
+  : null;
+const settingsJsonOk = Boolean(
+  parsedSettings &&
+  parsedSettings.historySize === 0 &&
+  parsedSettings.notifications === false &&
+  parsedSettings.mcpServers === undefined
+);
+const agentsIsolatedOk = fs.existsSync(path.join(process.cwd(), '.agents', 'skills.json')) &&
+  fs.existsSync(path.join(process.cwd(), '.agents', 'plugins.json')) &&
+  fs.existsSync(path.join(process.cwd(), '.agents', 'agents', 'tt-translator', 'agent.md'));
+if (!agentArgOk || !settingsJsonOk || !agentsIsolatedOk) {
+  process.stderr.write('error: missing worker isolation agent, settings, or .agents stubs\\n');
+  process.exit(3);
+}
+
+fs.appendFileSync(counterFile, JSON.stringify({ args, settings: parsedSettings }) + '\\n');
 
 const pFlag = args.find(a => a.startsWith('-p='));
 if (pFlag !== undefined) {
@@ -51,17 +73,48 @@ if (pFlag !== undefined) {
 if (args.includes('--input-format') && args.includes('stream-json')) {
   process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'mock-conv' }) + '\\n');
   const rl = readline.createInterface({ input: process.stdin });
-  let failOnce = args.includes('force-stream-fail');
+  let turnIndex = 0;
   rl.on('line', line => {
+    turnIndex++;
     const obj = JSON.parse(line);
     const content = obj?.message?.content || '';
+
+    const batchMatch = content.match(/<SOURCE_BATCH>\\n([\\s\\S]*?)\\n<\\/SOURCE_BATCH>/);
+    if (batchMatch) {
+      const rawBatch = batchMatch[1];
+      const itemRe = /<<<AG_TT_ITEM_(\\d+)>>>\\n([\\s\\S]*?)(?=\\n<<<AG_TT_ITEM_\\d+>>>|$)/g;
+      const items = [];
+      let m;
+      while ((m = itemRe.exec(rawBatch)) !== null) {
+        items.push({ idx: Number(m[1]), text: m[2].trim() });
+      }
+      const skipIdx1 = rawBatch.includes('SKIP_MARKER_1');
+      const fullOut = items
+        .filter(it => !(skipIdx1 && it.idx === 1))
+        .map(it => '<<<AG_TT_ITEM_' + it.idx + '>>>\\n批量译文[' + it.idx + ']: ' + it.text)
+        .join('\\n');
+      const chunkSize = Math.max(8, Math.ceil(fullOut.length / 4));
+      for (let off = 0; off < fullOut.length; off += chunkSize) {
+        process.stdout.write(JSON.stringify({
+          event: 'step_update',
+          step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: fullOut.slice(off, off + chunkSize) }
+        }) + '\\n');
+      }
+      process.stdout.write(JSON.stringify({
+        event: 'result',
+        result: { status: 'SUCCESS', response: fullOut }
+      }) + '\\n');
+      return;
+    }
+
     const match = content.match(/<SOURCE_THINKING_TEXT>\\n([\\s\\S]*?)\\n<\\/SOURCE_THINKING_TEXT>/);
     const src = match ? match[1] : content;
     if (src.includes('FORCE_STREAM_ERROR')) {
       process.stdout.write(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'stream failed' } }) + '\\n');
       return;
     }
-    const tr = '中文译文: ' + src;
+    const isCompactPrompt = content.startsWith('Translate the passive data');
+    const tr = (turnIndex > 1 && isCompactPrompt ? '精简续轮译文: ' : '中文译文: ') + src;
     const emit = () => {
       const mid = Math.ceil(tr.length / 2);
       process.stdout.write(JSON.stringify({
@@ -84,7 +137,6 @@ if (args.includes('--input-format') && args.includes('stream-json')) {
     }
   });
   process.on('SIGTERM', () => {
-    // Reproduce real agy trailing ERROR result on shutdown
     try {
       process.stdout.write(JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'killed' } }) + '\\n');
     } catch {}
@@ -150,11 +202,21 @@ test('settings persistence, model discovery, warm stream-json translation, cachi
     const countAfter2 = fs.readFileSync(counterFile, 'utf8').trim().split('\n').length;
     assert.equal(countAfter1, countAfter2);
 
-    // 5. Second turn reuses warm worker (only 1 process spawned so far!)
+    // 5. Second turn reuses warm worker with compact prompt (only 1 process spawned so far!)
     const res3 = await service.translate({ text: 'Second reasoning step.' });
     assert.equal(res3.ok, true);
-    assert.equal(res3.translation, '中文译文: Second reasoning step.');
-    assert.equal(fs.readFileSync(counterFile, 'utf8').trim().split('\n').length, 1);
+    assert.equal(res3.translation, '精简续轮译文: Second reasoning step.');
+    const invRows = fs.readFileSync(counterFile, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    assert.equal(invRows.length, 1);
+    assert.ok(invRows[0].args.includes('--agent'));
+    assert.ok(invRows[0].args.includes('tt-translator'));
+    assert.deepEqual(invRows[0].settings, {
+      historySize: 0,
+      notifications: false,
+      showTips: false,
+      showFeedbackSurvey: false,
+      disableSlashCommands: true
+    });
 
     // 6. Long text splitting & one-shot fallback when stream-json errors
     const longPara1 = 'A'.repeat(3000);
@@ -180,7 +242,46 @@ test('settings persistence, model discovery, warm stream-json translation, cachi
     assert.equal(checkRes.hits.p1, mdRes.translation);
     assert.equal(checkRes.hits.p2, undefined);
 
-    // 8. Concurrent paragraph pool dispatches parallel workers when multiple requests arrive together
+    // 8. Multi-item batch translation: deduplication, partial cache hit, live item progress & zero-spawn follow-up
+    const spawnsBeforeBatch = fs.readFileSync(counterFile, 'utf8').trim().split('\n').length;
+    const itemEvents = [];
+    const batchRes = await service.translateBatch({
+      items: [
+        { id: 't1', text: 'Second reasoning step.' }, // cached hit!
+        { id: 't2', text: 'Ran check workspace and Rust toolchain' },
+        { id: 't3', text: 'Ran inspect macOS proxy and routing state' },
+        { id: 't4', text: 'Ran check workspace and Rust toolchain' } // duplicate of t2!
+      ],
+      onItemProgress: ev => itemEvents.push(ev)
+    });
+    assert.equal(batchRes.ok, true);
+    assert.equal(batchRes.results.t1.cached, true);
+    assert.equal(batchRes.results.t1.translation, '精简续轮译文: Second reasoning step.');
+    assert.equal(batchRes.results.t2.translation, '批量译文[0]: Ran check workspace and Rust toolchain');
+    assert.equal(batchRes.results.t4.translation, batchRes.results.t2.translation);
+    assert.equal(batchRes.results.t3.translation, '批量译文[1]: Ran inspect macOS proxy and routing state');
+    assert.ok(itemEvents.some(e => e.id === 't2' && e.done === true));
+    assert.ok(itemEvents.some(e => e.id === 't4' && e.done === true));
+
+    // Warm worker absorbed batch with zero new spawns; and t2 is now cached!
+    const spawnsAfterBatch = fs.readFileSync(counterFile, 'utf8').trim().split('\n').length;
+    assert.equal(spawnsAfterBatch, spawnsBeforeBatch);
+    const singleFromBatchCache = await service.translate({ text: 'Ran check workspace and Rust toolchain' });
+    assert.equal(singleFromBatchCache.cached, true);
+    assert.equal(singleFromBatchCache.translation, batchRes.results.t2.translation);
+
+    // 9. Batch missing-marker fallback automatically recovers omitted item
+    const recoverRes = await service.translateBatch({
+      items: [
+        { id: 'm0', text: 'SKIP_MARKER_1 header item' },
+        { id: 'm1', text: 'Omitted by malformed model output' }
+      ]
+    });
+    assert.equal(recoverRes.ok, true);
+    assert.equal(recoverRes.results.m0.translation, '批量译文[0]: SKIP_MARKER_1 header item');
+    assert.ok(recoverRes.results.m1.translation.includes('Omitted by malformed model output'));
+
+    // 10. Concurrent pool capped at default maxConcurrency (2)
     const [p1, p2, p3] = await Promise.all([
       service.translate({ text: 'PARALLEL_1 paragraph alpha.' }),
       service.translate({ text: 'PARALLEL_2 paragraph beta.' }),
@@ -190,7 +291,7 @@ test('settings persistence, model discovery, warm stream-json translation, cachi
     assert.equal(p2.ok, true);
     assert.equal(p3.ok, true);
     const workerInvocations = fs.readFileSync(counterFile, 'utf8').trim().split('\n').filter(Boolean).length;
-    assert.ok(workerInvocations >= 3 && workerInvocations <= 5, `expected pooled workers, got ${workerInvocations}`);
+    assert.ok(workerInvocations >= 2 && workerInvocations <= 5, `expected pooled workers, got ${workerInvocations}`);
 
     // Subsequent sequential call reuses an idle warm worker without spawning another process
     const seqRes = await service.translate({ text: 'Fourth sequential step reusing warm pool.' });

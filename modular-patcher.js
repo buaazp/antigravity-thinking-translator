@@ -93,6 +93,7 @@ function generatePreloadSnippet() {
     '  listModels: (opts) => electron_1.ipcRenderer.invoke("thinking-translator:list-models", opts),',
     '  checkCache: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:check-cache", payload),',
     '  translate: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:translate", payload),',
+    '  translateBatch: (payload) => electron_1.ipcRenderer.invoke("thinking-translator:translate-batch", payload),',
     '  clearCache: () => electron_1.ipcRenderer.invoke("thinking-translator:clear-cache"),',
     '  getStatus: () => electron_1.ipcRenderer.invoke("thinking-translator:status"),',
     '  onProgress: (cb) => {',
