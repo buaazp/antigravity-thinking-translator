@@ -299,3 +299,61 @@ test('orderItemsVisibleFirstReverse prioritizes visible items then remaining ite
   assert.deepEqual(allOffscreen.visible, []);
   assert.deepEqual(allOffscreen.ordered, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
 });
+
+test('orderItemsByFocus adapts direction and proximity around viewport focus for completed vs streaming blocks', () => {
+  const items = Array.from({ length: 41 }, (_, i) => i);
+  const ten = Array.from({ length: 10 }, (_, i) => i);
+
+  // 1. Completed block expanded at top (0..3 visible, preferReverse=false) -> pure front-to-back
+  const completedTop = core.orderItemsByFocus(items, {
+    isVisible: n => n >= 0 && n <= 3,
+    preferReverse: false
+  });
+  assert.deepEqual(completedTop.visible, [0, 1, 2, 3]);
+  assert.deepEqual(completedTop.rest.slice(0, 4), [4, 5, 6, 7]);
+  assert.equal(completedTop.rest[completedTop.rest.length - 1], 40);
+  assert.deepEqual(completedTop.ordered, items);
+
+  // 2. Completed block collapsed / off-screen -> front-to-back (0 -> 9)
+  const completedCollapsed = core.orderItemsByFocus(ten, {
+    isVisible: () => false,
+    preferReverse: false
+  });
+  assert.deepEqual(completedCollapsed.visible, []);
+  assert.deepEqual(completedCollapsed.ordered, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+  // 3. Streaming block expanded at bottom (38..40 visible, preferReverse=true) -> pure back-to-front
+  const streamingBottom = core.orderItemsByFocus(items, {
+    isVisible: n => n >= 38,
+    preferReverse: true
+  });
+  assert.deepEqual(streamingBottom.visible, [40, 39, 38]);
+  assert.deepEqual(streamingBottom.rest.slice(0, 4), [37, 36, 35, 34]);
+  assert.equal(streamingBottom.rest[streamingBottom.rest.length - 1], 0);
+  assert.deepEqual(streamingBottom.ordered, items.slice().reverse());
+
+  // 4. Streaming block collapsed / off-screen -> back-to-front (9 -> 0)
+  const streamingCollapsed = core.orderItemsByFocus(ten, {
+    isVisible: () => false,
+    preferReverse: true
+  });
+  assert.deepEqual(streamingCollapsed.visible, []);
+  assert.deepEqual(streamingCollapsed.ordered, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+
+  // 5. Completed block scrolled to middle (18..20 visible, preferReverse=false) -> visible front-to-back, rest radiates outward favoring downward first
+  const completedMiddle = core.orderItemsByFocus(items, {
+    isVisible: n => n >= 18 && n <= 20,
+    preferReverse: false
+  });
+  assert.deepEqual(completedMiddle.visible, [18, 19, 20]);
+  assert.deepEqual(completedMiddle.rest.slice(0, 6), [21, 17, 22, 16, 23, 15]);
+
+  // 6. Completed block manually scrolled all the way to bottom (38..40 visible, preferReverse=false) -> translates from bottom focus upward
+  const completedScrolledBottom = core.orderItemsByFocus(items, {
+    isVisible: n => n >= 38,
+    preferReverse: false
+  });
+  assert.deepEqual(completedScrolledBottom.visible, [38, 39, 40]);
+  assert.deepEqual(completedScrolledBottom.rest.slice(0, 4), [37, 36, 35, 34]);
+  assert.equal(completedScrolledBottom.rest[completedScrolledBottom.rest.length - 1], 0);
+});

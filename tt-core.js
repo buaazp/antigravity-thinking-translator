@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.4.1';
+  const PLUGIN_VERSION = '0.4.2';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';
@@ -1198,6 +1198,62 @@
     return headHtml + injectCaretBeforeLastClose(renderSafeMarkdownHtml(activePara));
   }
 
+  function orderItemsByFocus(items, options = {}) {
+    const list = Array.isArray(items) ? items : [];
+    if (list.length === 0) {
+      return { visible: [], rest: [], ordered: [] };
+    }
+    const opts = typeof options === 'function'
+      ? { isVisible: options, preferReverse: false }
+      : (options || {});
+    const checkVisible = typeof opts.isVisible === 'function' ? opts.isVisible : () => false;
+    const preferReverse = Boolean(opts.preferReverse);
+
+    const visibleIndices = [];
+    const restIndices = [];
+    for (let i = 0; i < list.length; i++) {
+      if (checkVisible(list[i], i)) {
+        visibleIndices.push(i);
+      } else {
+        restIndices.push(i);
+      }
+    }
+
+    if (visibleIndices.length === 0) {
+      const ordered = preferReverse ? list.slice().reverse() : list.slice();
+      return { visible: [], rest: ordered, ordered: ordered.slice() };
+    }
+
+    const orderedVisIdx = preferReverse ? visibleIndices.slice().reverse() : visibleIndices;
+    const visible = orderedVisIdx.map(i => list[i]);
+
+    if (restIndices.length === 0) {
+      return { visible, rest: [], ordered: visible.slice() };
+    }
+
+    const firstVis = visibleIndices[0];
+    const lastVis = visibleIndices[visibleIndices.length - 1];
+    const distToFocus = idx => {
+      if (idx < firstVis) return firstVis - idx;
+      if (idx > lastVis) return idx - lastVis;
+      return 0;
+    };
+
+    restIndices.sort((a, b) => {
+      const da = distToFocus(a);
+      const db = distToFocus(b);
+      if (da !== db) return da - db;
+      if (da === 0) return preferReverse ? (b - a) : (a - b);
+      // Equidistant on opposite sides of focus:
+      // Completed (!preferReverse) prefers downward (idx > lastVis) first;
+      // Streaming (preferReverse) prefers upward (idx < firstVis) first.
+      return preferReverse ? (a - b) : (b - a);
+    });
+
+    const rest = restIndices.map(i => list[i]);
+    return { visible, rest, ordered: visible.concat(rest) };
+  }
+
   function orderItemsVisibleFirstReverse(items, isVisibleFn) {
     const list = Array.isArray(items) ? items : [];
     const checkVisible = typeof isVisibleFn === 'function' ? isVisibleFn : () => false;
@@ -1246,6 +1302,7 @@
     escapeHtml,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
+    orderItemsByFocus,
     orderItemsVisibleFirstReverse
   };
 });
