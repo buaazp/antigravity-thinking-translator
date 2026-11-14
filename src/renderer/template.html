@@ -1,0 +1,64 @@
+<button id="tt-capsule" class="tt-capsule" type="button" aria-expanded="false" data-state="active" title="思考过程自动翻译设置">
+  <span class="tt-dot"></span>
+  <span id="tt-capsule-label">译 · 简体中文</span>
+</button>
+
+<div id="tt-popover" class="tt-popover" data-open="false" role="dialog" aria-label="思考过程自动翻译设置">
+  <div class="tt-header">
+    <div class="tt-title-wrap">
+      <span>思考过程翻译</span>
+      <span id="tt-version" class="tt-version">v0.1.0</span>
+    </div>
+    <button id="tt-close" class="tt-close" type="button" title="关闭">✕</button>
+  </div>
+
+  <div class="tt-row-inline">
+    <span class="tt-label-inline">自动翻译思考过程</span>
+    <label class="tt-switch">
+      <input id="tt-enabled" type="checkbox" checked>
+      <span class="tt-slider"></span>
+    </label>
+  </div>
+
+  <div class="tt-row">
+    <label class="tt-label" for="tt-target-lang">目标语言</label>
+    <select id="tt-target-lang" class="tt-select"></select>
+    <div id="tt-custom-lang-wrap" class="tt-input-wrap" data-visible="false">
+      <input id="tt-custom-lang" class="tt-input" type="text" placeholder="输入自定义目标语言，如：粤语 / Arabic">
+    </div>
+  </div>
+
+  <div class="tt-row">
+    <span class="tt-label">显示方式</span>
+    <div class="tt-seg">
+      <button id="tt-mode-bilingual" class="tt-seg-btn" type="button" data-mode="bilingual" data-active="true">显示原文和译文</button>
+      <button id="tt-mode-translation" class="tt-seg-btn" type="button" data-mode="translation_only" data-active="false">只显示译文</button>
+    </div>
+  </div>
+
+  <div class="tt-row">
+    <label class="tt-label" for="tt-model">翻译模型（复用 Antigravity 内置模型）</label>
+    <div class="tt-model-bar">
+      <select id="tt-model" class="tt-select"></select>
+      <button id="tt-refresh-models" class="tt-icon-btn" type="button" title="从 agy models 刷新可用模型">刷新</button>
+    </div>
+  </div>
+
+  <div class="tt-row-inline">
+    <span class="tt-label-inline">双语/译文展开更大高度</span>
+    <label class="tt-switch">
+      <input id="tt-auto-expand" type="checkbox" checked>
+      <span class="tt-slider"></span>
+    </label>
+  </div>
+
+  <div class="tt-actions">
+    <button id="tt-translate-now" class="tt-btn tt-btn-primary" type="button">立即翻译当前思考</button>
+    <button id="tt-clear-cache" class="tt-btn" type="button">清空翻译缓存</button>
+  </div>
+
+  <div class="tt-footer">
+    <span id="tt-status-text">就绪</span>
+    <span id="tt-cache-stats">缓存: 0</span>
+  </div>
+</div>

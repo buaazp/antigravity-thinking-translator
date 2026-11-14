@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.asar
+*.log
+.live-session.json
+installation.json
+coverage/
+tmp/

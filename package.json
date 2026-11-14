@@ -1,0 +1,31 @@
+{
+  "name": "antigravity-thinking-translator",
+  "version": "0.1.0",
+  "description": "Auto-translate model thinking blocks in Google Antigravity 2.x using built-in Antigravity models, with configurable target language and bilingual / translation-only display modes.",
+  "main": "cli.js",
+  "bin": {
+    "ag-thinking-translator": "./cli.js"
+  },
+  "scripts": {
+    "build:renderer": "node scripts/build-renderer.js",
+    "pretest": "npm run build:renderer",
+    "test": "node --test test/*.test.js",
+    "check": "node cli.js check",
+    "install:plugin": "node cli.js install",
+    "live": "node cli.js live",
+    "status": "node cli.js status",
+    "restore": "node cli.js restore"
+  },
+  "keywords": [
+    "antigravity",
+    "thinking",
+    "translator",
+    "gemini",
+    "electron",
+    "plugin"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.4.0"
+  }
+}
