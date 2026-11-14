@@ -41,13 +41,13 @@
   const HOST_ID = 'ag-thinking-translator';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
-  const HOVER_DWELL_MS = 380;
+  const HOVER_DWELL_MS = 60;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
   const CLIENT_BATCH_MAX_ITEMS = 12;
   const CLIENT_BATCH_MAX_CHARS = 4200;
-  const HOVER_HEADER_SELECTOR = 'button[data-testid="thinking-collapsible-trigger"], button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
+  const HOVER_HEADER_SELECTOR = 'button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
   const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
@@ -105,8 +105,8 @@
   const bgQueue = [];
   const activeTasks = new Map(); // taskKey -> Task
 
-  const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #438780;\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\n  --tt-accent-text: #2f6f68;\n  --tt-success: #438780;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #6ab0a8;\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\n  --tt-accent-text: #8ccac2;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-accent);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n  transition: opacity 140ms ease;\n}\n\n.tt-row-sub[data-disabled=\"true\"] {\n  opacity: 0.46;\n  pointer-events: none;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-swatches {\n  display: grid;\n  grid-template-columns: repeat(3, minmax(0, 1fr));\n  gap: 6px;\n}\n\n.tt-swatch-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  min-width: 0;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text-muted);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n\n.tt-swatch-btn:hover {\n  border-color: var(--tt-accent);\n  color: var(--tt-text);\n}\n\n.tt-swatch-btn[data-active=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-swatch-dot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  flex-shrink: 0;\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.2</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
+  const TT_STYLES = ":host {\r\n  all: initial;\r\n  display: inline-flex;\r\n  align-items: center;\r\n  position: relative;\r\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\r\n  color: var(--tt-text);\r\n  -webkit-app-region: no-drag;\r\n  margin-right: 6px;\r\n  --tt-bg: rgba(255, 255, 255, 0.94);\r\n  --tt-bg-elevated: #ffffff;\r\n  --tt-bg-sub: #f4f5f7;\r\n  --tt-border: rgba(15, 23, 42, 0.12);\r\n  --tt-text: #111827;\r\n  --tt-text-muted: #6b7280;\r\n  --tt-accent: #438780;\r\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\r\n  --tt-accent-text: #2f6f68;\r\n  --tt-success: #438780;\r\n  --tt-warn: #f59e0b;\r\n  --tt-danger: #ef4444;\r\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\r\n}\r\n\r\n:host([data-theme=\"dark\"]) {\r\n  --tt-bg: rgba(28, 30, 36, 0.94);\r\n  --tt-bg-elevated: #1e2028;\r\n  --tt-bg-sub: #272a34;\r\n  --tt-border: rgba(255, 255, 255, 0.12);\r\n  --tt-text: #f3f4f6;\r\n  --tt-text-muted: #9ca3af;\r\n  --tt-accent: #6ab0a8;\r\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\r\n  --tt-accent-text: #8ccac2;\r\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\r\n}\r\n\r\n:host([data-dock=\"fixed\"]) {\r\n  position: fixed;\r\n  top: 8px;\r\n  right: 260px;\r\n  z-index: 9998;\r\n}\r\n\r\n.tt-capsule {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  gap: 5px;\r\n  height: 24px;\r\n  padding: 0 9px;\r\n  border-radius: 999px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  line-height: 1;\r\n  cursor: pointer;\r\n  user-select: none;\r\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\r\n  white-space: nowrap;\r\n}\r\n\r\n.tt-capsule:hover {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n}\r\n\r\n.tt-capsule[aria-expanded=\"true\"] {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n}\r\n\r\n.tt-dot {\r\n  width: 6px;\r\n  height: 6px;\r\n  border-radius: 50%;\r\n  background: var(--tt-text-muted);\r\n  flex-shrink: 0;\r\n}\r\n\r\n.tt-capsule[data-state=\"active\"] .tt-dot {\r\n  background: var(--tt-accent);\r\n}\r\n\r\n.tt-capsule[data-state=\"translating\"] .tt-dot {\r\n  background: var(--tt-accent);\r\n  animation: tt-pulse 1s ease-in-out infinite;\r\n}\r\n\r\n.tt-capsule[data-state=\"error\"] .tt-dot {\r\n  background: var(--tt-danger);\r\n}\r\n\r\n@keyframes tt-pulse {\r\n  0%, 100% { opacity: 1; transform: scale(1); }\r\n  50% { opacity: 0.45; transform: scale(0.8); }\r\n}\r\n\r\n.tt-popover {\r\n  position: fixed;\r\n  top: 42px;\r\n  right: 16px;\r\n  width: 344px;\r\n  max-width: calc(100vw - 24px);\r\n  background: var(--tt-bg-elevated);\r\n  border: 1px solid var(--tt-border);\r\n  border-radius: 12px;\r\n  box-shadow: var(--tt-shadow);\r\n  padding: 14px;\r\n  z-index: 2147483000;\r\n  display: none;\r\n  box-sizing: border-box;\r\n  font-size: 12px;\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-popover[data-open=\"true\"] {\r\n  display: block;\r\n}\r\n\r\n.tt-header {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  margin-bottom: 12px;\r\n  padding-bottom: 8px;\r\n  border-bottom: 1px solid var(--tt-border);\r\n}\r\n\r\n.tt-title-wrap {\r\n  display: flex;\r\n  align-items: center;\r\n  gap: 6px;\r\n  font-size: 13px;\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-version {\r\n  font-size: 10px;\r\n  padding: 1px 5px;\r\n  border-radius: 999px;\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-close {\r\n  border: none;\r\n  background: transparent;\r\n  color: var(--tt-text-muted);\r\n  cursor: pointer;\r\n  font-size: 15px;\r\n  line-height: 1;\r\n  padding: 2px 5px;\r\n  border-radius: 6px;\r\n}\r\n\r\n.tt-close:hover {\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-row {\r\n  margin-bottom: 10px;\r\n}\r\n\r\n.tt-row-inline {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: 8px;\r\n  margin-bottom: 10px;\r\n}\r\n\r\n.tt-label {\r\n  display: block;\r\n  font-size: 11px;\r\n  color: var(--tt-text-muted);\r\n  margin-bottom: 4px;\r\n  font-weight: 500;\r\n}\r\n\r\n.tt-label-inline {\r\n  font-size: 12px;\r\n  color: var(--tt-text);\r\n  font-weight: 500;\r\n}\r\n\r\n.tt-row-sub {\r\n  margin-top: -2px;\r\n  margin-bottom: 10px;\r\n  transition: opacity 140ms ease;\r\n}\r\n\r\n.tt-row-sub[data-disabled=\"true\"] {\r\n  opacity: 0.46;\r\n  pointer-events: none;\r\n}\r\n\r\n.tt-label-stack {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  min-width: 0;\r\n}\r\n\r\n.tt-row-sub .tt-label-inline {\r\n  font-size: 11.5px;\r\n  font-weight: 400;\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-subhint {\r\n  font-size: 10.5px;\r\n  line-height: 1.25;\r\n  color: var(--tt-text-muted);\r\n}\r\n\r\n.tt-select,\r\n.tt-input {\r\n  width: 100%;\r\n  box-sizing: border-box;\r\n  padding: 6px 8px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 12px;\r\n  outline: none;\r\n}\r\n\r\n.tt-select:focus,\r\n.tt-input:focus {\r\n  border-color: var(--tt-accent);\r\n}\r\n\r\n.tt-input-wrap {\r\n  margin-top: 6px;\r\n  display: none;\r\n}\r\n\r\n.tt-input-wrap[data-visible=\"true\"] {\r\n  display: block;\r\n}\r\n\r\n.tt-label-bar {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: 8px;\r\n  margin-bottom: 4px;\r\n}\r\n\r\n.tt-label-bar .tt-label {\r\n  margin-bottom: 0;\r\n}\r\n\r\n.tt-link-btn {\r\n  border: none;\r\n  background: transparent;\r\n  padding: 1px 4px;\r\n  border-radius: 5px;\r\n  font-size: 11px;\r\n  font-weight: 500;\r\n  color: var(--tt-accent-text);\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-link-btn:hover {\r\n  background: var(--tt-accent-soft);\r\n}\r\n\r\n.tt-link-btn:disabled {\r\n  opacity: 0.55;\r\n  cursor: default;\r\n}\r\n\r\n.tt-model-cascade {\r\n  display: grid;\r\n  grid-template-columns: 1.35fr 1fr;\r\n  gap: 6px;\r\n  align-items: end;\r\n}\r\n\r\n.tt-cascade-col {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 3px;\r\n  min-width: 0;\r\n}\r\n\r\n.tt-sublabel {\r\n  font-size: 10.5px;\r\n  color: var(--tt-text-muted);\r\n  line-height: 1.2;\r\n}\r\n\r\n.tt-seg {\r\n  display: grid;\r\n  grid-template-columns: 1fr 1fr;\r\n  gap: 4px;\r\n  padding: 3px;\r\n  border-radius: 8px;\r\n  background: var(--tt-bg-sub);\r\n  border: 1px solid var(--tt-border);\r\n}\r\n\r\n.tt-seg-btn {\r\n  border: none;\r\n  border-radius: 6px;\r\n  padding: 5px 8px;\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  cursor: pointer;\r\n  background: transparent;\r\n  color: var(--tt-text-muted);\r\n  transition: background-color 120ms ease, color 120ms ease;\r\n}\r\n\r\n.tt-seg-btn[data-active=\"true\"] {\r\n  background: var(--tt-accent);\r\n  color: #ffffff;\r\n}\r\n\r\n.tt-swatches {\r\n  display: grid;\r\n  grid-template-columns: repeat(3, minmax(0, 1fr));\r\n  gap: 6px;\r\n}\r\n\r\n.tt-swatch-btn {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  justify-content: center;\r\n  gap: 5px;\r\n  min-width: 0;\r\n  padding: 6px 8px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text-muted);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  line-height: 1;\r\n  cursor: pointer;\r\n  white-space: nowrap;\r\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\r\n}\r\n\r\n.tt-swatch-btn:hover {\r\n  border-color: var(--tt-accent);\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-swatch-btn[data-active=\"true\"] {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-swatch-dot {\r\n  width: 8px;\r\n  height: 8px;\r\n  border-radius: 50%;\r\n  flex-shrink: 0;\r\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\r\n}\r\n\r\n.tt-switch {\r\n  position: relative;\r\n  display: inline-flex;\r\n  align-items: center;\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-switch input {\r\n  position: absolute;\r\n  opacity: 0;\r\n  width: 0;\r\n  height: 0;\r\n}\r\n\r\n.tt-slider {\r\n  width: 34px;\r\n  height: 18px;\r\n  border-radius: 999px;\r\n  background: var(--tt-border);\r\n  position: relative;\r\n  transition: background-color 140ms ease;\r\n}\r\n\r\n.tt-slider::after {\r\n  content: \"\";\r\n  position: absolute;\r\n  top: 2px;\r\n  left: 2px;\r\n  width: 14px;\r\n  height: 14px;\r\n  border-radius: 50%;\r\n  background: #ffffff;\r\n  transition: transform 140ms ease;\r\n}\r\n\r\n.tt-switch input:checked + .tt-slider {\r\n  background: var(--tt-accent);\r\n}\r\n\r\n.tt-switch input:checked + .tt-slider::after {\r\n  transform: translateX(16px);\r\n}\r\n\r\n.tt-actions {\r\n  display: grid;\r\n  grid-template-columns: 1fr 1fr;\r\n  gap: 8px;\r\n  margin-top: 10px;\r\n}\r\n\r\n.tt-btn {\r\n  padding: 6px 10px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-btn:hover {\r\n  border-color: var(--tt-accent);\r\n}\r\n\r\n.tt-btn-primary {\r\n  background: var(--tt-accent);\r\n  border-color: var(--tt-accent);\r\n  color: #ffffff;\r\n}\r\n\r\n.tt-btn-primary:hover {\r\n  filter: brightness(1.06);\r\n}\r\n\r\n.tt-footer {\r\n  margin-top: 10px;\r\n  padding-top: 8px;\r\n  border-top: 1px solid var(--tt-border);\r\n  font-size: 11px;\r\n  color: var(--tt-text-muted);\r\n  display: flex;\r\n  justify-content: space-between;\r\n  align-items: center;\r\n  gap: 8px;\r\n}\r\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\r\n  <span class=\"tt-dot\"></span>\r\n  <span id=\"tt-capsule-label\">翻译 · 简体中文</span>\r\n</button>\r\n\r\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\r\n  <div class=\"tt-header\">\r\n    <div class=\"tt-title-wrap\">\r\n      <span>思考过程翻译</span>\r\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.2</span>\r\n    </div>\r\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\r\n  </div>\r\n\r\n  <div class=\"tt-row-inline\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\r\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\r\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\r\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\r\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\r\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">显示方式</span>\r\n    <div class=\"tt-seg\">\r\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\r\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\r\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <div class=\"tt-label-bar\">\r\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\r\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\r\n    </div>\r\n    <div class=\"tt-model-cascade\">\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">模型</span>\r\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\r\n      </div>\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">思考等级</span>\r\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\r\n      </div>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-actions\">\r\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\r\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\r\n  </div>\r\n\r\n  <div class=\"tt-footer\">\r\n    <span id=\"tt-status-text\">就绪</span>\r\n    <span id=\"tt-cache-stats\">缓存: 0</span>\r\n  </div>\r\n</div>\r\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -292,14 +292,30 @@
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"][data-ag-tt-active="1"] > button[data-testid="thinking-collapsible-trigger"] + div.overflow-y-auto {
         max-height: 360px !important;
       }
+      [data-ag-tt-wrapper="1"] {
+        position: relative;
+      }
       [data-ag-tt-wrapper="1"][data-ag-tt-has-badge="1"] > button[data-testid="thinking-collapsible-trigger"] {
         padding-right: 92px;
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-has-tools="1"] > button[data-testid="thinking-collapsible-trigger"] {
         padding-right: 196px;
       }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"] > .ag-tt-trigger-bar {
+        display: none;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"]:hover > .ag-tt-trigger-bar {
+        display: inline-flex;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"]:hover > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 92px;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"][data-ag-tt-hover-tools="1"]:hover > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 142px;
+      }
       [data-ag-tt-manual-group="1"],
-      [data-ag-tt-hover-host="1"] {
+      [data-ag-tt-hover-host="1"],
+      [data-ag-tt-group-idle-expanded="1"] {
         position: relative;
       }
       [data-ag-tt-manual-group="1"][data-ag-tt-has-group-badge="1"] > button[data-testid] {
@@ -308,7 +324,20 @@
       [data-ag-tt-manual-group="1"][data-ag-tt-has-group-tools="1"] > button[data-testid] {
         padding-right: 142px;
       }
-      [data-ag-tt-hover-host="1"] > button[data-testid] {
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"] > .ag-tt-group-bar {
+        display: none;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"]:hover > .ag-tt-group-bar {
+        display: inline-flex;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"]:hover > button[data-testid] {
+        padding-right: 96px;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"][data-ag-tt-group-hover-tools="1"]:hover > button[data-testid] {
+        padding-right: 142px;
+      }
+      [data-ag-tt-hover-host="1"] > button[data-testid],
+      [data-ag-tt-group-idle-expanded="1"] > button[data-testid] {
         padding-right: 68px;
       }
       [data-ag-tt-title-mode="translation_only"] > [data-ag-tt-title-ready="1"] {
@@ -420,7 +449,8 @@
       .ag-tt-group-badge[data-status="idle"] {
         opacity: 0.85;
       }
-      .ag-tt-hover-translate-btn {
+      .ag-tt-hover-translate-btn,
+      .ag-tt-group-idle-btn {
         position: absolute;
         top: 5px;
         right: 26px;
@@ -443,7 +473,8 @@
         animation: agTtHoverIn 140ms ease-out both;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
       }
-      .ag-tt-hover-translate-btn:hover {
+      .ag-tt-hover-translate-btn:hover,
+      .ag-tt-group-idle-btn:hover {
         background: var(--ag-tt-accent, #438780);
         border-color: var(--ag-tt-accent, #438780);
         color: #ffffff;
@@ -793,7 +824,7 @@
     const capLabel = el('tt-capsule-label');
     const effLang = getEffectiveTargetLang(settings);
     if (capLabel) {
-      capLabel.textContent = settings.enabled ? `译 · ${effLang}` : '译 · 已暂停';
+      capLabel.textContent = settings.enabled ? `翻译 · ${effLang}` : '翻译 · 已暂停';
     }
     if (cap) {
       let stateAttr = settings.enabled ? 'active' : 'off';
@@ -878,6 +909,8 @@
           gw.removeAttribute('data-ag-tt-manual-group');
           gw.removeAttribute('data-ag-tt-has-group-badge');
           gw.removeAttribute('data-ag-tt-has-group-tools');
+          gw.removeAttribute('data-ag-tt-group-hover');
+          gw.removeAttribute('data-ag-tt-group-hover-tools');
           for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) {
             bar.remove();
           }
@@ -959,6 +992,8 @@
           gw.removeAttribute('data-ag-tt-manual-group');
           gw.removeAttribute('data-ag-tt-has-group-badge');
           gw.removeAttribute('data-ag-tt-has-group-tools');
+          gw.removeAttribute('data-ag-tt-group-hover');
+          gw.removeAttribute('data-ag-tt-group-hover-tools');
           for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) bar.remove();
         }
         manualGroupStates.delete(gw);
@@ -1805,14 +1840,9 @@
 
     const allowed = isRegionAllowed(wrapper, st);
     const prog = precomputedProg || computeWrapperProgress(st);
-    const visible = allowed && (settings.enabled || st.manualActivated || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0);
-
-    if (!visible) {
-      if (bar) bar.style.display = 'none';
-      wrapper.removeAttribute('data-ag-tt-has-badge');
-      wrapper.removeAttribute('data-ag-tt-has-tools');
-      return;
-    }
+    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+    const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
+    const effectiveStatus = allowed ? prog.overallStatus : 'idle';
 
     if (!bar) {
       bar = document.createElement('div');
@@ -1871,22 +1901,32 @@
         ev.preventDefault();
         ev.stopPropagation();
         const progNow = computeWrapperProgress(st);
-        if (progNow.overallStatus === 'done') {
+        if (progNow.overallStatus === 'done' && isRegionAllowed(wrapper, st)) {
           deactivateWrapperTranslation(wrapper);
           return;
         }
-        const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
-        const viewport = getViewportContainer(wrapper, trigger);
-        if (!viewport && trigger) {
+        st.manualDismissed = false;
+        st.manualActivated = true;
+        const trig = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+        const viewport = getViewportContainer(wrapper, trig);
+        if (!viewport && trig) {
+          if (!settings.enabled) {
+            void triggerManualRegionTranslation(trig, false);
+            return;
+          }
           if (progNow.overallStatus !== 'translating') {
             st.autoTranslateOnExpand = true;
             st.forceTranslateOnExpand = false;
           }
-          trigger.click();
+          trig.click();
           return;
         }
         if (progNow.overallStatus !== 'translating') {
-          void translateWrapperNow(wrapper, false);
+          if (!settings.enabled) {
+            void triggerManualRegionTranslation(trig, false);
+          } else {
+            void translateWrapperNow(wrapper, false);
+          }
         }
       });
 
@@ -1897,9 +1937,9 @@
       wrapper.appendChild(bar);
     }
 
-    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
-    const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
-    const showTools = isExpanded && (prog.translating > 0 || prog.done > 0);
+    const showToolsExpanded = isExpanded && allowed && (prog.translating > 0 || prog.done > 0);
+    const showToolsHover = !isExpanded && allowed && (effectiveStatus === 'done' || effectiveStatus === 'partial');
+    const alwaysShow = isExpanded || effectiveStatus === 'translating' || effectiveStatus === 'error';
     const effMode = getEffectiveWrapperMode(st);
     const effLang = getEffectiveTargetLang(settings);
 
@@ -1909,40 +1949,50 @@
     const badge = bar.querySelector('.ag-tt-trigger-badge');
 
     if (toggleBtn) {
-      toggleBtn.style.display = showTools ? 'inline-flex' : 'none';
+      toggleBtn.style.display = showToolsExpanded ? 'inline-flex' : 'none';
       toggleBtn.textContent = effMode === 'translation_only' ? '显示原文' : '只看译文';
     }
     if (retranslateBtn) {
-      retranslateBtn.style.display = showTools ? 'inline-flex' : 'none';
+      retranslateBtn.style.display = (showToolsExpanded || showToolsHover) ? 'inline-flex' : 'none';
     }
     if (copyBtn) {
-      copyBtn.style.display = showTools && prog.hasTranslatedContent ? 'inline-flex' : 'none';
+      copyBtn.style.display = (showToolsExpanded && prog.hasTranslatedContent) ? 'inline-flex' : 'none';
     }
 
     if (badge) {
-      badge.setAttribute('data-status', prog.overallStatus);
-      if (prog.overallStatus === 'translating') {
-        badge.textContent = prog.total > 1 ? `译中 ${prog.done}/${prog.total}` : '译中...';
+      badge.setAttribute('data-status', effectiveStatus);
+      if (effectiveStatus === 'translating') {
+        badge.textContent = prog.total > 1 ? `翻译中 ${prog.done}/${prog.total}` : '翻译中...';
         badge.title = '正在流式翻译思考段落';
-      } else if (prog.overallStatus === 'done') {
+      } else if (effectiveStatus === 'done') {
         badge.textContent = `已译 · ${effLang}`;
         badge.title = '点击关闭翻译，恢复原始状态';
-      } else if (prog.overallStatus === 'partial') {
+      } else if (effectiveStatus === 'partial') {
         badge.textContent = `已译 ${prog.done}/${prog.total}`;
         badge.title = '点击继续翻译剩余段落';
-      } else if (prog.overallStatus === 'error') {
-        badge.textContent = '译失败';
+      } else if (effectiveStatus === 'error') {
+        badge.textContent = '翻译失败';
         badge.title = '点击重试翻译';
       } else {
-        badge.textContent = '译';
+        badge.textContent = '翻译';
         badge.title = '点击翻译该段思考';
       }
     }
 
-    bar.style.display = 'inline-flex';
-    wrapper.setAttribute('data-ag-tt-has-badge', '1');
-    if (showTools) wrapper.setAttribute('data-ag-tt-has-tools', '1');
-    else wrapper.removeAttribute('data-ag-tt-has-tools');
+    bar.style.display = '';
+    if (alwaysShow) {
+      wrapper.removeAttribute('data-ag-tt-bar-hover');
+      wrapper.removeAttribute('data-ag-tt-hover-tools');
+      wrapper.setAttribute('data-ag-tt-has-badge', '1');
+      if (showToolsExpanded) wrapper.setAttribute('data-ag-tt-has-tools', '1');
+      else wrapper.removeAttribute('data-ag-tt-has-tools');
+    } else {
+      wrapper.removeAttribute('data-ag-tt-has-badge');
+      wrapper.removeAttribute('data-ag-tt-has-tools');
+      wrapper.setAttribute('data-ag-tt-bar-hover', '1');
+      if (showToolsHover) wrapper.setAttribute('data-ag-tt-hover-tools', '1');
+      else wrapper.removeAttribute('data-ag-tt-hover-tools');
+    }
   }
 
   function resetSingleTitleEntry(containerEl) {
@@ -2069,6 +2119,8 @@
       groupWrapper.removeAttribute('data-ag-tt-manual-group');
       groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
       groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
       for (const bar of groupWrapper.querySelectorAll(':scope > .ag-tt-group-bar')) {
         bar.remove();
       }
@@ -2220,7 +2272,7 @@
       origEl.removeAttribute('data-ag-tt-title-ready');
       transEl.style.display = '';
       transEl.classList.add('ag-tt-title-pending');
-      transEl.textContent = '译中...';
+      transEl.textContent = '翻译中...';
       containerEl.removeAttribute('data-ag-tt-header-wrap');
     } else {
       origEl.removeAttribute('data-ag-tt-title-ready');
@@ -2973,6 +3025,8 @@
     if (settings.enabled || !groupWrapper.hasAttribute('data-ag-tt-manual-group')) {
       groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
       groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
       for (const old of groupWrapper.querySelectorAll(':scope > .ag-tt-group-bar')) old.remove();
       return;
     }
@@ -3083,10 +3137,10 @@
     if (badge) {
       badge.setAttribute('data-status', status);
       if (status === 'translating') {
-        badge.textContent = total > 1 ? `译中 ${done}/${total}` : '译中...';
+        badge.textContent = total > 1 ? `翻译中 ${done}/${total}` : '翻译中...';
         badge.title = '正在翻译该区域标题与思考详情';
       } else if (status === 'error') {
-        badge.textContent = '译失败';
+        badge.textContent = '翻译失败';
         badge.title = '点击重试翻译';
       } else if (status === 'partial') {
         badge.textContent = `已译 ${done}/${total}`;
@@ -3097,10 +3151,61 @@
       }
     }
 
-    bar.style.display = 'inline-flex';
-    groupWrapper.setAttribute('data-ag-tt-has-group-badge', '1');
-    if (showTools) groupWrapper.setAttribute('data-ag-tt-has-group-tools', '1');
-    else groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+    const alwaysShow = isExpanded || status === 'translating' || status === 'error';
+    bar.style.display = '';
+    if (alwaysShow) {
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
+      groupWrapper.setAttribute('data-ag-tt-has-group-badge', '1');
+      if (showTools) groupWrapper.setAttribute('data-ag-tt-has-group-tools', '1');
+      else groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+    } else {
+      groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
+      groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.setAttribute('data-ag-tt-group-hover', '1');
+      if (showTools) groupWrapper.setAttribute('data-ag-tt-group-hover-tools', '1');
+      else groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
+    }
+  }
+
+  function syncIdleGroupExpandedButtons() {
+    const groupBtns = document.querySelectorAll(HOVER_HEADER_SELECTOR);
+    const activeHosts = new Set();
+    if (!settings.enabled) {
+      for (const btn of groupBtns) {
+        const hostEl = btn.parentElement;
+        if (!hostEl || !hostEl.isConnected) continue;
+        if (hostEl.hasAttribute('data-ag-tt-manual-group')) continue;
+        if (btn.getAttribute('aria-expanded') !== 'true') continue;
+        activeHosts.add(hostEl);
+        hostEl.setAttribute('data-ag-tt-group-idle-expanded', '1');
+        let idleBtn = hostEl.querySelector(':scope > .ag-tt-group-idle-btn');
+        if (!idleBtn) {
+          idleBtn = document.createElement('button');
+          idleBtn.type = 'button';
+          idleBtn.className = 'ag-tt-group-idle-btn';
+          idleBtn.setAttribute('data-ag-tt-ui', '1');
+          idleBtn.textContent = '翻译';
+          idleBtn.title = '手动翻译该区域内的标题和思考详情';
+          idleBtn.addEventListener('click', ev => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (btn.isConnected) {
+              void triggerManualRegionTranslation(btn, false);
+            }
+          });
+          hostEl.appendChild(idleBtn);
+        }
+      }
+    }
+    for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
+      if (!activeHosts.has(hostNode)) {
+        hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
+        for (const old of hostNode.querySelectorAll(':scope > .ag-tt-group-idle-btn')) {
+          old.remove();
+        }
+      }
+    }
   }
 
   function hideHoverTranslateButton() {
@@ -3122,9 +3227,10 @@
   function isHeaderAlreadyActivated(btn) {
     if (!btn || !btn.isConnected) return true;
     const isThinkingTrig = btn.getAttribute('data-testid') === 'thinking-collapsible-trigger';
+    if (isThinkingTrig) return true;
+    if (btn.getAttribute('aria-expanded') === 'true') return true;
     const wrapper = btn.parentElement;
-    const st = isThinkingTrig && wrapper ? blockStates.get(wrapper) : null;
-    return isRegionAllowed(wrapper || btn, st);
+    return isRegionAllowed(wrapper || btn, null);
   }
 
   function showHoverTranslateButton(headerBtn) {
@@ -3456,6 +3562,7 @@
     }
 
     scanCollapsedToolGroups(targetLang, model, prewarmItems);
+    syncIdleGroupExpandedButtons();
 
     if (!initialScanDone) {
       initialScanDone = true;
@@ -3810,6 +3917,9 @@
       if (gw.isConnected) {
         gw.removeAttribute('data-ag-tt-manual-group');
         gw.removeAttribute('data-ag-tt-has-group-badge');
+        gw.removeAttribute('data-ag-tt-has-group-tools');
+        gw.removeAttribute('data-ag-tt-group-hover');
+        gw.removeAttribute('data-ag-tt-group-hover-tools');
         for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar, :scope > [data-ag-tt-ui]')) {
           bar.remove();
         }
@@ -3836,6 +3946,8 @@
       wrapper.removeAttribute('data-ag-tt-active');
       wrapper.removeAttribute('data-ag-tt-has-badge');
       wrapper.removeAttribute('data-ag-tt-has-tools');
+      wrapper.removeAttribute('data-ag-tt-bar-hover');
+      wrapper.removeAttribute('data-ag-tt-hover-tools');
       for (const bar of wrapper.querySelectorAll(':scope > .ag-tt-trigger-bar, :scope > [data-ag-tt-ui]')) {
         bar.remove();
       }
@@ -3850,7 +3962,10 @@
     for (const hostNode of document.querySelectorAll('[data-ag-tt-hover-host]')) {
       hostNode.removeAttribute('data-ag-tt-hover-host');
     }
-    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-bar')) t.remove();
+    for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
+      hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
+    }
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();

@@ -41,13 +41,13 @@
   const HOST_ID = 'ag-thinking-translator';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
-  const HOVER_DWELL_MS = 380;
+  const HOVER_DWELL_MS = 60;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
   const CLIENT_BATCH_MAX_ITEMS = 12;
   const CLIENT_BATCH_MAX_CHARS = 4200;
-  const HOVER_HEADER_SELECTOR = 'button[data-testid="thinking-collapsible-trigger"], button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
+  const HOVER_HEADER_SELECTOR = 'button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
   const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
@@ -291,14 +291,30 @@
       [data-ag-tt-wrapper="1"][data-ag-tt-mode="bilingual"][data-ag-tt-active="1"] > button[data-testid="thinking-collapsible-trigger"] + div.overflow-y-auto {
         max-height: 360px !important;
       }
+      [data-ag-tt-wrapper="1"] {
+        position: relative;
+      }
       [data-ag-tt-wrapper="1"][data-ag-tt-has-badge="1"] > button[data-testid="thinking-collapsible-trigger"] {
         padding-right: 92px;
       }
       [data-ag-tt-wrapper="1"][data-ag-tt-has-tools="1"] > button[data-testid="thinking-collapsible-trigger"] {
         padding-right: 196px;
       }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"] > .ag-tt-trigger-bar {
+        display: none;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"]:hover > .ag-tt-trigger-bar {
+        display: inline-flex;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"]:hover > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 92px;
+      }
+      [data-ag-tt-wrapper="1"][data-ag-tt-bar-hover="1"][data-ag-tt-hover-tools="1"]:hover > button[data-testid="thinking-collapsible-trigger"] {
+        padding-right: 142px;
+      }
       [data-ag-tt-manual-group="1"],
-      [data-ag-tt-hover-host="1"] {
+      [data-ag-tt-hover-host="1"],
+      [data-ag-tt-group-idle-expanded="1"] {
         position: relative;
       }
       [data-ag-tt-manual-group="1"][data-ag-tt-has-group-badge="1"] > button[data-testid] {
@@ -307,7 +323,20 @@
       [data-ag-tt-manual-group="1"][data-ag-tt-has-group-tools="1"] > button[data-testid] {
         padding-right: 142px;
       }
-      [data-ag-tt-hover-host="1"] > button[data-testid] {
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"] > .ag-tt-group-bar {
+        display: none;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"]:hover > .ag-tt-group-bar {
+        display: inline-flex;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"]:hover > button[data-testid] {
+        padding-right: 96px;
+      }
+      [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"][data-ag-tt-group-hover-tools="1"]:hover > button[data-testid] {
+        padding-right: 142px;
+      }
+      [data-ag-tt-hover-host="1"] > button[data-testid],
+      [data-ag-tt-group-idle-expanded="1"] > button[data-testid] {
         padding-right: 68px;
       }
       [data-ag-tt-title-mode="translation_only"] > [data-ag-tt-title-ready="1"] {
@@ -419,7 +448,8 @@
       .ag-tt-group-badge[data-status="idle"] {
         opacity: 0.85;
       }
-      .ag-tt-hover-translate-btn {
+      .ag-tt-hover-translate-btn,
+      .ag-tt-group-idle-btn {
         position: absolute;
         top: 5px;
         right: 26px;
@@ -442,7 +472,8 @@
         animation: agTtHoverIn 140ms ease-out both;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
       }
-      .ag-tt-hover-translate-btn:hover {
+      .ag-tt-hover-translate-btn:hover,
+      .ag-tt-group-idle-btn:hover {
         background: var(--ag-tt-accent, #438780);
         border-color: var(--ag-tt-accent, #438780);
         color: #ffffff;
@@ -792,7 +823,7 @@
     const capLabel = el('tt-capsule-label');
     const effLang = getEffectiveTargetLang(settings);
     if (capLabel) {
-      capLabel.textContent = settings.enabled ? `译 · ${effLang}` : '译 · 已暂停';
+      capLabel.textContent = settings.enabled ? `翻译 · ${effLang}` : '翻译 · 已暂停';
     }
     if (cap) {
       let stateAttr = settings.enabled ? 'active' : 'off';
@@ -877,6 +908,8 @@
           gw.removeAttribute('data-ag-tt-manual-group');
           gw.removeAttribute('data-ag-tt-has-group-badge');
           gw.removeAttribute('data-ag-tt-has-group-tools');
+          gw.removeAttribute('data-ag-tt-group-hover');
+          gw.removeAttribute('data-ag-tt-group-hover-tools');
           for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) {
             bar.remove();
           }
@@ -958,6 +991,8 @@
           gw.removeAttribute('data-ag-tt-manual-group');
           gw.removeAttribute('data-ag-tt-has-group-badge');
           gw.removeAttribute('data-ag-tt-has-group-tools');
+          gw.removeAttribute('data-ag-tt-group-hover');
+          gw.removeAttribute('data-ag-tt-group-hover-tools');
           for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar')) bar.remove();
         }
         manualGroupStates.delete(gw);
@@ -1804,14 +1839,9 @@
 
     const allowed = isRegionAllowed(wrapper, st);
     const prog = precomputedProg || computeWrapperProgress(st);
-    const visible = allowed && (settings.enabled || st.manualActivated || prog.done > 0 || prog.translating > 0 || prog.errorCount > 0);
-
-    if (!visible) {
-      if (bar) bar.style.display = 'none';
-      wrapper.removeAttribute('data-ag-tt-has-badge');
-      wrapper.removeAttribute('data-ag-tt-has-tools');
-      return;
-    }
+    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+    const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
+    const effectiveStatus = allowed ? prog.overallStatus : 'idle';
 
     if (!bar) {
       bar = document.createElement('div');
@@ -1870,22 +1900,32 @@
         ev.preventDefault();
         ev.stopPropagation();
         const progNow = computeWrapperProgress(st);
-        if (progNow.overallStatus === 'done') {
+        if (progNow.overallStatus === 'done' && isRegionAllowed(wrapper, st)) {
           deactivateWrapperTranslation(wrapper);
           return;
         }
-        const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
-        const viewport = getViewportContainer(wrapper, trigger);
-        if (!viewport && trigger) {
+        st.manualDismissed = false;
+        st.manualActivated = true;
+        const trig = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
+        const viewport = getViewportContainer(wrapper, trig);
+        if (!viewport && trig) {
+          if (!settings.enabled) {
+            void triggerManualRegionTranslation(trig, false);
+            return;
+          }
           if (progNow.overallStatus !== 'translating') {
             st.autoTranslateOnExpand = true;
             st.forceTranslateOnExpand = false;
           }
-          trigger.click();
+          trig.click();
           return;
         }
         if (progNow.overallStatus !== 'translating') {
-          void translateWrapperNow(wrapper, false);
+          if (!settings.enabled) {
+            void triggerManualRegionTranslation(trig, false);
+          } else {
+            void translateWrapperNow(wrapper, false);
+          }
         }
       });
 
@@ -1896,9 +1936,9 @@
       wrapper.appendChild(bar);
     }
 
-    const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
-    const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
-    const showTools = isExpanded && (prog.translating > 0 || prog.done > 0);
+    const showToolsExpanded = isExpanded && allowed && (prog.translating > 0 || prog.done > 0);
+    const showToolsHover = !isExpanded && allowed && (effectiveStatus === 'done' || effectiveStatus === 'partial');
+    const alwaysShow = isExpanded || effectiveStatus === 'translating' || effectiveStatus === 'error';
     const effMode = getEffectiveWrapperMode(st);
     const effLang = getEffectiveTargetLang(settings);
 
@@ -1908,40 +1948,50 @@
     const badge = bar.querySelector('.ag-tt-trigger-badge');
 
     if (toggleBtn) {
-      toggleBtn.style.display = showTools ? 'inline-flex' : 'none';
+      toggleBtn.style.display = showToolsExpanded ? 'inline-flex' : 'none';
       toggleBtn.textContent = effMode === 'translation_only' ? '显示原文' : '只看译文';
     }
     if (retranslateBtn) {
-      retranslateBtn.style.display = showTools ? 'inline-flex' : 'none';
+      retranslateBtn.style.display = (showToolsExpanded || showToolsHover) ? 'inline-flex' : 'none';
     }
     if (copyBtn) {
-      copyBtn.style.display = showTools && prog.hasTranslatedContent ? 'inline-flex' : 'none';
+      copyBtn.style.display = (showToolsExpanded && prog.hasTranslatedContent) ? 'inline-flex' : 'none';
     }
 
     if (badge) {
-      badge.setAttribute('data-status', prog.overallStatus);
-      if (prog.overallStatus === 'translating') {
-        badge.textContent = prog.total > 1 ? `译中 ${prog.done}/${prog.total}` : '译中...';
+      badge.setAttribute('data-status', effectiveStatus);
+      if (effectiveStatus === 'translating') {
+        badge.textContent = prog.total > 1 ? `翻译中 ${prog.done}/${prog.total}` : '翻译中...';
         badge.title = '正在流式翻译思考段落';
-      } else if (prog.overallStatus === 'done') {
+      } else if (effectiveStatus === 'done') {
         badge.textContent = `已译 · ${effLang}`;
         badge.title = '点击关闭翻译，恢复原始状态';
-      } else if (prog.overallStatus === 'partial') {
+      } else if (effectiveStatus === 'partial') {
         badge.textContent = `已译 ${prog.done}/${prog.total}`;
         badge.title = '点击继续翻译剩余段落';
-      } else if (prog.overallStatus === 'error') {
-        badge.textContent = '译失败';
+      } else if (effectiveStatus === 'error') {
+        badge.textContent = '翻译失败';
         badge.title = '点击重试翻译';
       } else {
-        badge.textContent = '译';
+        badge.textContent = '翻译';
         badge.title = '点击翻译该段思考';
       }
     }
 
-    bar.style.display = 'inline-flex';
-    wrapper.setAttribute('data-ag-tt-has-badge', '1');
-    if (showTools) wrapper.setAttribute('data-ag-tt-has-tools', '1');
-    else wrapper.removeAttribute('data-ag-tt-has-tools');
+    bar.style.display = '';
+    if (alwaysShow) {
+      wrapper.removeAttribute('data-ag-tt-bar-hover');
+      wrapper.removeAttribute('data-ag-tt-hover-tools');
+      wrapper.setAttribute('data-ag-tt-has-badge', '1');
+      if (showToolsExpanded) wrapper.setAttribute('data-ag-tt-has-tools', '1');
+      else wrapper.removeAttribute('data-ag-tt-has-tools');
+    } else {
+      wrapper.removeAttribute('data-ag-tt-has-badge');
+      wrapper.removeAttribute('data-ag-tt-has-tools');
+      wrapper.setAttribute('data-ag-tt-bar-hover', '1');
+      if (showToolsHover) wrapper.setAttribute('data-ag-tt-hover-tools', '1');
+      else wrapper.removeAttribute('data-ag-tt-hover-tools');
+    }
   }
 
   function resetSingleTitleEntry(containerEl) {
@@ -2068,6 +2118,8 @@
       groupWrapper.removeAttribute('data-ag-tt-manual-group');
       groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
       groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
       for (const bar of groupWrapper.querySelectorAll(':scope > .ag-tt-group-bar')) {
         bar.remove();
       }
@@ -2219,7 +2271,7 @@
       origEl.removeAttribute('data-ag-tt-title-ready');
       transEl.style.display = '';
       transEl.classList.add('ag-tt-title-pending');
-      transEl.textContent = '译中...';
+      transEl.textContent = '翻译中...';
       containerEl.removeAttribute('data-ag-tt-header-wrap');
     } else {
       origEl.removeAttribute('data-ag-tt-title-ready');
@@ -2972,6 +3024,8 @@
     if (settings.enabled || !groupWrapper.hasAttribute('data-ag-tt-manual-group')) {
       groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
       groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
       for (const old of groupWrapper.querySelectorAll(':scope > .ag-tt-group-bar')) old.remove();
       return;
     }
@@ -3082,10 +3136,10 @@
     if (badge) {
       badge.setAttribute('data-status', status);
       if (status === 'translating') {
-        badge.textContent = total > 1 ? `译中 ${done}/${total}` : '译中...';
+        badge.textContent = total > 1 ? `翻译中 ${done}/${total}` : '翻译中...';
         badge.title = '正在翻译该区域标题与思考详情';
       } else if (status === 'error') {
-        badge.textContent = '译失败';
+        badge.textContent = '翻译失败';
         badge.title = '点击重试翻译';
       } else if (status === 'partial') {
         badge.textContent = `已译 ${done}/${total}`;
@@ -3096,10 +3150,61 @@
       }
     }
 
-    bar.style.display = 'inline-flex';
-    groupWrapper.setAttribute('data-ag-tt-has-group-badge', '1');
-    if (showTools) groupWrapper.setAttribute('data-ag-tt-has-group-tools', '1');
-    else groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+    const alwaysShow = isExpanded || status === 'translating' || status === 'error';
+    bar.style.display = '';
+    if (alwaysShow) {
+      groupWrapper.removeAttribute('data-ag-tt-group-hover');
+      groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
+      groupWrapper.setAttribute('data-ag-tt-has-group-badge', '1');
+      if (showTools) groupWrapper.setAttribute('data-ag-tt-has-group-tools', '1');
+      else groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+    } else {
+      groupWrapper.removeAttribute('data-ag-tt-has-group-badge');
+      groupWrapper.removeAttribute('data-ag-tt-has-group-tools');
+      groupWrapper.setAttribute('data-ag-tt-group-hover', '1');
+      if (showTools) groupWrapper.setAttribute('data-ag-tt-group-hover-tools', '1');
+      else groupWrapper.removeAttribute('data-ag-tt-group-hover-tools');
+    }
+  }
+
+  function syncIdleGroupExpandedButtons() {
+    const groupBtns = document.querySelectorAll(HOVER_HEADER_SELECTOR);
+    const activeHosts = new Set();
+    if (!settings.enabled) {
+      for (const btn of groupBtns) {
+        const hostEl = btn.parentElement;
+        if (!hostEl || !hostEl.isConnected) continue;
+        if (hostEl.hasAttribute('data-ag-tt-manual-group')) continue;
+        if (btn.getAttribute('aria-expanded') !== 'true') continue;
+        activeHosts.add(hostEl);
+        hostEl.setAttribute('data-ag-tt-group-idle-expanded', '1');
+        let idleBtn = hostEl.querySelector(':scope > .ag-tt-group-idle-btn');
+        if (!idleBtn) {
+          idleBtn = document.createElement('button');
+          idleBtn.type = 'button';
+          idleBtn.className = 'ag-tt-group-idle-btn';
+          idleBtn.setAttribute('data-ag-tt-ui', '1');
+          idleBtn.textContent = '翻译';
+          idleBtn.title = '手动翻译该区域内的标题和思考详情';
+          idleBtn.addEventListener('click', ev => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (btn.isConnected) {
+              void triggerManualRegionTranslation(btn, false);
+            }
+          });
+          hostEl.appendChild(idleBtn);
+        }
+      }
+    }
+    for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
+      if (!activeHosts.has(hostNode)) {
+        hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
+        for (const old of hostNode.querySelectorAll(':scope > .ag-tt-group-idle-btn')) {
+          old.remove();
+        }
+      }
+    }
   }
 
   function hideHoverTranslateButton() {
@@ -3121,9 +3226,10 @@
   function isHeaderAlreadyActivated(btn) {
     if (!btn || !btn.isConnected) return true;
     const isThinkingTrig = btn.getAttribute('data-testid') === 'thinking-collapsible-trigger';
+    if (isThinkingTrig) return true;
+    if (btn.getAttribute('aria-expanded') === 'true') return true;
     const wrapper = btn.parentElement;
-    const st = isThinkingTrig && wrapper ? blockStates.get(wrapper) : null;
-    return isRegionAllowed(wrapper || btn, st);
+    return isRegionAllowed(wrapper || btn, null);
   }
 
   function showHoverTranslateButton(headerBtn) {
@@ -3455,6 +3561,7 @@
     }
 
     scanCollapsedToolGroups(targetLang, model, prewarmItems);
+    syncIdleGroupExpandedButtons();
 
     if (!initialScanDone) {
       initialScanDone = true;
@@ -3809,6 +3916,9 @@
       if (gw.isConnected) {
         gw.removeAttribute('data-ag-tt-manual-group');
         gw.removeAttribute('data-ag-tt-has-group-badge');
+        gw.removeAttribute('data-ag-tt-has-group-tools');
+        gw.removeAttribute('data-ag-tt-group-hover');
+        gw.removeAttribute('data-ag-tt-group-hover-tools');
         for (const bar of gw.querySelectorAll(':scope > .ag-tt-group-bar, :scope > [data-ag-tt-ui]')) {
           bar.remove();
         }
@@ -3835,6 +3945,8 @@
       wrapper.removeAttribute('data-ag-tt-active');
       wrapper.removeAttribute('data-ag-tt-has-badge');
       wrapper.removeAttribute('data-ag-tt-has-tools');
+      wrapper.removeAttribute('data-ag-tt-bar-hover');
+      wrapper.removeAttribute('data-ag-tt-hover-tools');
       for (const bar of wrapper.querySelectorAll(':scope > .ag-tt-trigger-bar, :scope > [data-ag-tt-ui]')) {
         bar.remove();
       }
@@ -3849,7 +3961,10 @@
     for (const hostNode of document.querySelectorAll('[data-ag-tt-hover-host]')) {
       hostNode.removeAttribute('data-ag-tt-hover-host');
     }
-    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-bar')) t.remove();
+    for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
+      hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
+    }
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();

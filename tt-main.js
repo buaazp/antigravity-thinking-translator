@@ -1,11 +1,6 @@
 'use strict';
 
-let fs;
-try {
-  fs = require('original-fs');
-} catch {
-  fs = require('fs');
-}
+const fs = require('fs');
 const path = require('path');
 
 let ipcMain = null;
@@ -63,7 +58,10 @@ function getWindowWebContents(win) {
       }
       for (const child of children) {
         if (child?.webContents && !child.webContents.isDestroyed?.()) {
-          return child.webContents;
+          const url = child.webContents.getURL?.() || '';
+          if (!url.startsWith('data:')) {
+            return child.webContents;
+          }
         }
       }
     }
