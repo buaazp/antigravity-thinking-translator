@@ -177,16 +177,21 @@ async function injectIntoLiveWindows(options = {}) {
   let injectedCount = 0;
   for (const page of info.pages) {
     const origin = new URL(page.url).origin;
-    const ipcVersion = await evalInPage(
+    const hasCompatibleIpc = await evalInPage(
       page.webSocketDebuggerUrl,
-      'window.thinkingTranslatorAPI ? (window.thinkingTranslatorAPI.version || "legacy") : null'
-    ).catch(() => null);
-    if (!ipcVersion || ipcVersion !== PLUGIN_VERSION) {
+      'Boolean(window.thinkingTranslatorAPI && typeof window.thinkingTranslatorAPI.getSettings === "function" && typeof window.thinkingTranslatorAPI.translateBatch === "function")'
+    ).catch(() => false);
+    if (!hasCompatibleIpc) {
       const liveSession = await ensureLiveBridge(origin, options);
       await evalInPage(
         page.webSocketDebuggerUrl,
         `window.__AGThinkingTranslatorLive = ${JSON.stringify({ port: liveSession.port, token: liveSession.token, version: PLUGIN_VERSION })};`
       );
+    } else {
+      await evalInPage(
+        page.webSocketDebuggerUrl,
+        'try { delete window.__AGThinkingTranslatorLive; } catch { window.__AGThinkingTranslatorLive = null; } true;'
+      ).catch(() => {});
     }
     await evalInPage(page.webSocketDebuggerUrl, bundle);
     injectedCount++;

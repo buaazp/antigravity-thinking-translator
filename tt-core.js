@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.5.1';
+  const PLUGIN_VERSION = '0.5.2';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';

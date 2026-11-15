@@ -138,8 +138,7 @@
   function getIpcApi() {
     const ipc = typeof window !== 'undefined' && window.thinkingTranslatorAPI ? window.thinkingTranslatorAPI : null;
     if (!ipc) return null;
-    const live = getLiveInfo();
-    if (live && live.version === PLUGIN_VERSION && ipc.version !== PLUGIN_VERSION) {
+    if (typeof ipc.getSettings !== 'function' || typeof ipc.translateBatch !== 'function') {
       return null;
     }
     return ipc;
