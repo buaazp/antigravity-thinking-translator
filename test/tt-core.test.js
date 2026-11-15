@@ -357,3 +357,15 @@ test('orderItemsByFocus adapts direction and proximity around viewport focus for
   assert.deepEqual(completedScrolledBottom.rest.slice(0, 4), [37, 36, 35, 34]);
   assert.equal(completedScrolledBottom.rest[completedScrolledBottom.rest.length - 1], 0);
 });
+
+test('conversation title helpers skip placeholders and already-translated titles while detecting English titles', () => {
+  assert.equal(core.isPlaceholderConversationTitle('Untitled Conversation'), true);
+  assert.equal(core.isPlaceholderConversationTitle('New Conversation'), true);
+  assert.equal(core.isPlaceholderConversationTitle('Clone And Install Unslop Repository'), false);
+
+  assert.equal(core.shouldTranslateConversationTitle('GitHub Antigravity Thinking Translator Plugin Installation', '简体中文'), true);
+  assert.equal(core.shouldTranslateConversationTitle('GitHub Antigravity 思考翻译插件安装', '简体中文'), false);
+  assert.equal(core.shouldTranslateConversationTitle('UI 优化', '简体中文'), false);
+  assert.equal(core.shouldTranslateConversationTitle('Untitled Conversation', '简体中文'), false);
+  assert.equal(core.cleanConversationTitleTranslation('"克隆并安装 Unslop 仓库"\n多余说明'), '克隆并安装 Unslop 仓库');
+});

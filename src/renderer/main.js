@@ -28,6 +28,9 @@
     resolveCascadeSelection,
     shouldTranslateText,
     shouldTranslateTitle,
+    isPlaceholderConversationTitle,
+    shouldTranslateConversationTitle,
+    cleanConversationTitleTranslation,
     translateBoilerplateTitle,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
@@ -72,6 +75,14 @@
   let hoverBtnEl = null;
   let activeHoverHost = null;
   let activeHoverTarget = null;
+  let cachedReduxStore = null;
+  let unsubscribeReduxStore = null;
+  let lastReduxSummarySig = '';
+  let convHoverTimer = 0;
+  let hoveredConvSegEl = null;
+  let activeConvHoverSegEl = null;
+  let convHoverBtnEl = null;
+  let convHoverTranslating = false;
   let themeObserver = null;
   let domObserver = null;
   let titlebarResizeObserver = null;
@@ -92,6 +103,8 @@
   const seenToolGroups = new WeakMap(); // buttonEl -> last thinking fingerprint
   const historicalToolGroups = new WeakSet();
   const toolGroupStates = new WeakMap(); // buttonEl -> Array<FiberBlockState>
+  const convTitleStates = new Map(); // stateKey -> ConvTitleState
+  const knownTranslatedConvTitles = new Set(); // `${targetLang}\0${title}`
 
   // Client-side canonical memory cache (canonKey -> translation) & negative check cache
   const memCache = new Map();
@@ -473,6 +486,49 @@
         background: var(--ag-tt-accent, #438780);
         border-color: var(--ag-tt-accent, #438780);
         color: #ffffff;
+      }
+      .ag-tt-conv-title-btn {
+        flex-shrink: 0;
+        margin-left: 6px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 22px;
+        padding: 0 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1;
+        font-weight: 500;
+        white-space: nowrap;
+        cursor: pointer;
+        user-select: none;
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+        backdrop-filter: blur(6px);
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
+        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        color: var(--ag-tt-accent-text, #2f6f68);
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        animation: agTtHoverIn 140ms ease-out both;
+        transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+      }
+      .ag-tt-conv-title-btn:hover:not([disabled]) {
+        background: var(--ag-tt-accent, #438780);
+        border-color: var(--ag-tt-accent, #438780);
+        color: #ffffff;
+      }
+      .ag-tt-conv-title-btn[data-status="translating"] {
+        cursor: default;
+        opacity: 0.85;
+        animation: agTtPulse 1.2s ease-in-out infinite;
+      }
+      .ag-tt-conv-title-btn[data-status="error"] {
+        color: #ef4444;
+        background: rgba(239, 68, 68, 0.12);
+        border-color: rgba(239, 68, 68, 0.28);
+      }
+      [data-ag-tt-conv-orig-hidden="1"] {
+        display: none !important;
       }
       @keyframes agTtHoverIn {
         from { opacity: 0; transform: scale(0.95); }
@@ -875,6 +931,13 @@
     if (clearMem) {
       memCache.clear();
       checkedCanonMisses.clear();
+      knownTranslatedConvTitles.clear();
+      for (const st of convTitleStates.values()) {
+        if (st.activeTaskKey) {
+          detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+        }
+      }
+      convTitleStates.clear();
     }
     clearQueuedTasks();
 
@@ -966,6 +1029,7 @@
 
   function deactivateAllToVanilla() {
     hideHoverTranslateButton();
+    hideConvTitleHoverButton();
     resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
@@ -978,6 +1042,10 @@
       deactivateAllToVanilla();
     } else if (!prevEnabled && settings.enabled) {
       hideHoverTranslateButton();
+      hideConvTitleHoverButton();
+      for (const st of convTitleStates.values()) {
+        st.failedSourceKey = '';
+      }
       for (const wrapper of trackedWrappers) {
         const st = blockStates.get(wrapper);
         if (st) st.manualDismissed = false;
@@ -2572,6 +2640,326 @@
     }
   }
 
+  let lastObservedCascadeId = '';
+
+  function ensureReduxStoreSubscribed(probeEl) {
+    if (cachedReduxStore || !probeEl) return cachedReduxStore;
+    let cur = getReactFiber(probeEl);
+    for (let i = 0; i < 220 && cur; i++) {
+      const p = cur.memoizedProps;
+      const candidate = p?.value?.store || p?.store;
+      if (candidate && typeof candidate.getState === 'function' && typeof candidate.subscribe === 'function') {
+        cachedReduxStore = candidate;
+        try {
+          unsubscribeReduxStore = candidate.subscribe(() => {
+            if (disposed || !cachedReduxStore) return;
+            try {
+              const m = location.pathname.match(/^\/c\/([^/?#]+)/);
+              const cid = (m && m[1]) || lastObservedCascadeId;
+              const sumObj = cid ? cachedReduxStore.getState()?.trajectorySummaries?.summaries?.[cid] : null;
+              const sig = `${cid || ''}\0${sumObj?.summary || ''}\0${sumObj?.annotations?.title || ''}`;
+              if (sig !== lastReduxSummarySig) {
+                lastReduxSummarySig = sig;
+                scheduleFastTitleSync();
+              }
+            } catch {}
+          });
+        } catch {}
+        return cachedReduxStore;
+      }
+      cur = cur.return;
+    }
+    return null;
+  }
+
+  function findConversationTitleTargets() {
+    const targets = [];
+    const titlebars = document.querySelectorAll('[class*="@container/titlebar"]');
+    for (let tbIdx = 0; tbIdx < titlebars.length; tbIdx++) {
+      const titlebar = titlebars[tbIdx];
+      if (!titlebar || !titlebar.isConnected) continue;
+      const segs = Array.from(titlebar.querySelectorAll('[data-testid="breadcrumb-segment"]'));
+      if (!segs.length) continue;
+
+      let chosen = null;
+      for (const segEl of segs) {
+        let onRename = null;
+        let fiberName = '';
+        let isEditing = false;
+        let cascadeId = '';
+        let cur = getReactFiber(segEl);
+        for (let i = 0; i < 16 && cur; i++) {
+          const p = cur.memoizedProps;
+          if (p && typeof p === 'object') {
+            if (!onRename && typeof p.onRename === 'function') {
+              onRename = p.onRename;
+              if (typeof p.name === 'string') fiberName = p.name;
+              if (p.isEditing !== undefined) isEditing = Boolean(p.isEditing);
+            }
+            if (!cascadeId && typeof p.cascadeId === 'string' && p.cascadeId) {
+              cascadeId = p.cascadeId;
+            }
+          }
+          if (onRename && cascadeId) break;
+          cur = cur.return;
+        }
+        if (onRename) {
+          chosen = { segEl, onRename, fiberName, isEditing, cascadeId };
+          break;
+        }
+      }
+
+      if (!chosen) {
+        const pathMatch = location.pathname.match(/^\/c\/([^/?#]+)/);
+        const fallbackSeg = segs.length >= 2
+          ? segs[segs.length - 1]
+          : (segs[0] && document.title.startsWith(readVisibleDomText(segs[0], '').replace(/\s+/g, ' ').trim()) ? segs[0] : null);
+        if (fallbackSeg && pathMatch && pathMatch[1]) {
+          chosen = {
+            segEl: fallbackSeg,
+            onRename: null,
+            fiberName: '',
+            isEditing: false,
+            cascadeId: pathMatch[1]
+          };
+        }
+      }
+
+      if (!chosen || !chosen.segEl || !chosen.segEl.isConnected) continue;
+      ensureReduxStoreSubscribed(chosen.segEl);
+      if (chosen.cascadeId) lastObservedCascadeId = chosen.cascadeId;
+
+      let storeSummary = '';
+      let storeAnnotationsTitle = '';
+      try {
+        const sumObj = chosen.cascadeId
+          ? cachedReduxStore?.getState?.()?.trajectorySummaries?.summaries?.[chosen.cascadeId]
+          : null;
+        if (typeof sumObj?.summary === 'string') storeSummary = sumObj.summary.replace(/\s+/g, ' ').trim();
+        if (typeof sumObj?.annotations?.title === 'string') storeAnnotationsTitle = sumObj.annotations.title.replace(/\s+/g, ' ').trim();
+      } catch {}
+
+      const domText = readVisibleDomText(chosen.segEl, '').replace(/\s+/g, ' ').trim();
+      const currentTitle = storeAnnotationsTitle || storeSummary || chosen.fiberName || domText;
+      const stateKey = chosen.cascadeId || `tb-${tbIdx}`;
+      const sig = `${chosen.cascadeId || ''}\0${storeSummary}\0${storeAnnotationsTitle}`;
+      if (sig && sig !== lastReduxSummarySig && chosen.cascadeId) {
+        lastReduxSummarySig = sig;
+      }
+
+      targets.push({
+        titlebar,
+        segEl: chosen.segEl,
+        hostEl: chosen.segEl.parentElement,
+        stateKey,
+        cascadeId: chosen.cascadeId,
+        onRename: chosen.onRename,
+        isEditing: chosen.isEditing || Boolean(chosen.segEl.querySelector('input, textarea')),
+        currentTitle,
+        storeSummary,
+        storeAnnotationsTitle,
+        domText
+      });
+    }
+    return targets;
+  }
+
+  function resolvePendingConvTitleSource(target, targetLang, opts = {}) {
+    if (!target || !target.segEl?.isConnected || target.isEditing) return null;
+    const st = convTitleStates.get(target.stateKey);
+    const cand = target.currentTitle;
+    if (cand && !isPlaceholderConversationTitle(cand)) {
+      if (opts.force || (!knownTranslatedConvTitles.has(`${targetLang}\0${cand}`) && shouldTranslateConversationTitle(cand, targetLang))) {
+        return cand;
+      }
+    }
+    if (
+      st &&
+      target.storeSummary &&
+      target.storeSummary !== st.lastTranslatedSummary &&
+      (!target.storeAnnotationsTitle || target.storeAnnotationsTitle === st.lastAppliedTitle)
+    ) {
+      if (
+        !isPlaceholderConversationTitle(target.storeSummary) &&
+        !knownTranslatedConvTitles.has(`${targetLang}\0${target.storeSummary}`) &&
+        shouldTranslateConversationTitle(target.storeSummary, targetLang)
+      ) {
+        return target.storeSummary;
+      }
+    }
+    return null;
+  }
+
+  async function applyConversationTitleReplacement(target, cleanTitle) {
+    if (!cleanTitle || !target || !target.segEl?.isConnected) return false;
+    for (const old of target.segEl.querySelectorAll('.ag-tt-conv-title-dom-fallback')) {
+      old.remove();
+    }
+    for (const hidden of target.segEl.querySelectorAll('[data-ag-tt-conv-orig-hidden]')) {
+      hidden.removeAttribute('data-ag-tt-conv-orig-hidden');
+    }
+
+    if (typeof target.onRename === 'function') {
+      try {
+        await target.onRename(cleanTitle);
+        return true;
+      } catch {}
+    }
+
+    const origSpan = Array.from(target.segEl.children).find(c => !c.hasAttribute('data-ag-tt-ui'));
+    if (origSpan) {
+      origSpan.setAttribute('data-ag-tt-conv-orig-hidden', '1');
+      const fallbackEl = document.createElement('span');
+      fallbackEl.className = 'truncate inline-block ag-tt-conv-title-dom-fallback';
+      fallbackEl.setAttribute('data-ag-tt-ui', '1');
+      fallbackEl.textContent = cleanTitle;
+      origSpan.insertAdjacentElement('afterend', fallbackEl);
+    } else {
+      target.segEl.textContent = cleanTitle;
+    }
+
+    if (target.domText && document.title.startsWith(target.domText)) {
+      document.title = cleanTitle + document.title.slice(target.domText.length);
+    }
+    return true;
+  }
+
+  async function triggerConversationTitleTranslation(target, opts = {}) {
+    if (disposed || !target || !target.segEl?.isConnected) return;
+    const targetLang = getEffectiveTargetLang(settings);
+    const model = settings.model || DEFAULT_MODEL;
+    const sourceText = resolvePendingConvTitleSource(target, targetLang, opts);
+    if (!sourceText) {
+      convHoverTranslating = false;
+      hideConvTitleHoverButton();
+      return;
+    }
+
+    const stateKey = target.stateKey;
+    let st = convTitleStates.get(stateKey);
+    if (!st) {
+      st = {
+        status: 'idle',
+        activeSourceKey: '',
+        activeTaskKey: '',
+        activeSubscriber: null,
+        lastTranslatedSource: '',
+        lastTranslatedSummary: '',
+        lastAppliedTitle: '',
+        lastTargetLang: '',
+        failedSourceKey: ''
+      };
+      convTitleStates.set(stateKey, st);
+    }
+
+    const sourceKey = `${targetLang}\0${sourceText}`;
+    if (!opts.force && !opts.manual && (st.status === 'queued' || st.status === 'translating') && st.activeSourceKey === sourceKey) {
+      return;
+    }
+    if (!opts.force && !opts.manual && st.failedSourceKey === sourceKey) {
+      return;
+    }
+
+    if (st.activeTaskKey) {
+      detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+      st.activeTaskKey = '';
+      st.activeSubscriber = null;
+    }
+
+    if (opts.manual && !opts.force) {
+      await prewarmBackendCache([{ text: sourceText }], targetLang, model, { skipScan: true });
+      if (disposed) return;
+    }
+
+    st.status = 'queued';
+    st.activeSourceKey = sourceKey;
+    st.failedSourceKey = '';
+
+    const subscriber = {
+      onStart: () => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.status = 'translating';
+      },
+      onDone: (finalText, _cached) => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.activeTaskKey = '';
+        st.activeSubscriber = null;
+        const cleanTitle = cleanConversationTitleTranslation(finalText);
+        if (!cleanTitle) {
+          st.status = 'error';
+          st.failedSourceKey = sourceKey;
+          convHoverTranslating = false;
+          if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+            convHoverBtnEl.disabled = false;
+            convHoverBtnEl.setAttribute('data-status', 'error');
+            convHoverBtnEl.textContent = '翻译失败';
+          }
+          return;
+        }
+        st.status = 'done';
+        st.lastTranslatedSource = sourceText;
+        st.lastTranslatedSummary = target.storeSummary || sourceText;
+        st.lastAppliedTitle = cleanTitle;
+        st.lastTargetLang = targetLang;
+        st.failedSourceKey = '';
+        knownTranslatedConvTitles.add(`${targetLang}\0${sourceText}`);
+        knownTranslatedConvTitles.add(`${targetLang}\0${cleanTitle}`);
+
+        convHoverTranslating = false;
+        hideConvTitleHoverButton();
+
+        const liveTarget = findConversationTitleTargets().find(t => t.stateKey === stateKey) || target;
+        if (cleanTitle !== liveTarget.currentTitle) {
+          void applyConversationTitleReplacement(liveTarget, cleanTitle);
+        }
+      },
+      onError: _errMsg => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.activeTaskKey = '';
+        st.activeSubscriber = null;
+        st.status = 'error';
+        st.failedSourceKey = sourceKey;
+        convHoverTranslating = false;
+        if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+          convHoverBtnEl.disabled = false;
+          convHoverBtnEl.setAttribute('data-status', 'error');
+          convHoverBtnEl.textContent = '翻译失败';
+        }
+      }
+    };
+
+    const snap = opts.manual ? captureQueueSnapshot() : null;
+    st.activeSubscriber = subscriber;
+    st.activeTaskKey = enqueueTranslationTask({
+      text: sourceText,
+      targetLang,
+      model,
+      force: Boolean(opts.force),
+      priority: 'title',
+      subscriber
+    }) || '';
+    if (opts.manual && st.activeTaskKey) {
+      promoteNewQueueTasksToFront(snap);
+      flushSchedulerBatches();
+    }
+  }
+
+  function scanConversationTitles(prewarmItems = [], opts = {}) {
+    if (disposed) return;
+    const targetLang = getEffectiveTargetLang(settings);
+    const targets = findConversationTitleTargets();
+    for (const target of targets) {
+      const sourceText = resolvePendingConvTitleSource(target, targetLang, opts);
+      if (!sourceText) continue;
+      if (Array.isArray(prewarmItems)) {
+        prewarmItems.push({ text: sourceText });
+      }
+      if (settings.enabled || opts.manual) {
+        void triggerConversationTitleTranslation(target, opts);
+      }
+    }
+  }
+
   function startDomParaTranslation(wrapper, st, p, targetLang, model, force, priority) {
     const activeCanon = p.canonKey;
     st.hasStartedTranslation = true;
@@ -3232,13 +3620,97 @@
 
   function resolveHoverHeaderButton(node) {
     if (!node || node.nodeType !== 1) return null;
-    if (node.closest('#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], .ag-tt-trigger-bar, .ag-tt-group-bar')) {
+    if (node.closest('#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], .ag-tt-trigger-bar, .ag-tt-group-bar, .ag-tt-conv-title-btn')) {
       return null;
     }
     if (node.closest('.ag-tt-hover-translate-btn')) {
       return activeHoverTarget || hoveredHeaderBtn;
     }
     return node.closest(HOVER_HEADER_SELECTOR);
+  }
+
+  function hideConvTitleHoverButton(force = false) {
+    if (convHoverTimer) {
+      clearTimeout(convHoverTimer);
+      convHoverTimer = 0;
+    }
+    if (convHoverTranslating && !force) return;
+    hoveredConvSegEl = null;
+    activeConvHoverSegEl = null;
+    if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+      convHoverBtnEl.remove();
+    }
+  }
+
+  function resolveConvTitleHoverTarget(node) {
+    if (!node || node.nodeType !== 1) return null;
+    if (node.closest('.ag-tt-conv-title-btn')) {
+      const seg = activeConvHoverSegEl || hoveredConvSegEl;
+      if (!seg || !seg.isConnected) return null;
+      const targets = findConversationTitleTargets();
+      return targets.find(t => t.segEl === seg) || null;
+    }
+    const titlebar = node.closest('[class*="@container/titlebar"]');
+    if (!titlebar) return null;
+    if (node.closest('#ag-thinking-translator, #ag-context-meter, [data-testid="pane-titlebar-toolbar"], [role="dialog"], [role="menu"], [role="listbox"], button')) {
+      return null;
+    }
+    const targetLang = getEffectiveTargetLang(settings);
+    const targets = findConversationTitleTargets().filter(t => t.titlebar === titlebar);
+    for (const t of targets) {
+      const strip = t.hostEl?.parentElement;
+      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node)) || (strip && strip.contains(node));
+      if (!hitSeg) continue;
+      if (!resolvePendingConvTitleSource(t, targetLang)) continue;
+      const st = convTitleStates.get(t.stateKey);
+      if (!settings.enabled || st?.status === 'error') {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  function showConvTitleHoverButton(target) {
+    if (disposed || !target || !target.segEl?.isConnected) return;
+    const hostEl = target.hostEl;
+    if (!hostEl || !hostEl.isConnected) return;
+
+    if (!convHoverBtnEl) {
+      convHoverBtnEl = document.createElement('button');
+      convHoverBtnEl.type = 'button';
+      convHoverBtnEl.className = 'ag-tt-conv-title-btn';
+      convHoverBtnEl.setAttribute('data-ag-tt-ui', '1');
+      convHoverBtnEl.title = '翻译当前会话标题并替换';
+      const stop = ev => ev.stopPropagation();
+      convHoverBtnEl.addEventListener('pointerdown', stop);
+      convHoverBtnEl.addEventListener('mousedown', stop);
+      convHoverBtnEl.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (convHoverTranslating) return;
+        const seg = activeConvHoverSegEl;
+        const currentTarget = (seg && findConversationTitleTargets().find(t => t.segEl === seg)) || null;
+        if (!currentTarget) {
+          hideConvTitleHoverButton(true);
+          return;
+        }
+        convHoverTranslating = true;
+        convHoverBtnEl.disabled = true;
+        convHoverBtnEl.setAttribute('data-status', 'translating');
+        convHoverBtnEl.textContent = '翻译中...';
+        void triggerConversationTitleTranslation(currentTarget, { force: false, manual: true });
+      });
+    }
+
+    if (!convHoverTranslating) {
+      convHoverBtnEl.disabled = false;
+      convHoverBtnEl.removeAttribute('data-status');
+      convHoverBtnEl.textContent = '翻译';
+    }
+    activeConvHoverSegEl = target.segEl;
+    if (convHoverBtnEl.parentElement !== hostEl) {
+      hostEl.appendChild(convHoverBtnEl);
+    }
   }
 
   async function triggerManualRegionTranslation(targetBtn, force = false) {
@@ -3461,7 +3933,8 @@
     const model = settings.model || DEFAULT_MODEL;
     const prewarmItems = [];
 
-    // Priority 0: Always translate allowed group headers & step titles FIRST
+    // Priority 0: Always translate allowed group headers, step titles & conversation title FIRST
+    scanConversationTitles(prewarmItems, { force: false, manual: false });
     scanStepAndHeaderTitles(targetLang, model, prewarmItems, false);
 
     const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
@@ -3539,6 +4012,7 @@
     titleSyncRaf = requestAnimationFrame(() => {
       titleSyncRaf = 0;
       if (disposed) return;
+      scanConversationTitles([], { force: false, manual: false });
       scanStepAndHeaderTitles(getEffectiveTargetLang(settings), settings.model || DEFAULT_MODEL, [], false);
     });
   }
@@ -3689,6 +4163,27 @@
     docMouseOverHandler = ev => {
       if (disposed) return;
       const target = ev.target && ev.target.nodeType === 1 ? ev.target : ev.target?.parentElement;
+
+      const convTarget = resolveConvTitleHoverTarget(target);
+      if (convTarget) {
+        if (hoveredHeaderBtn || activeHoverTarget) hideHoverTranslateButton();
+        if (convTarget.segEl === activeConvHoverSegEl) return;
+        if (convTarget.segEl === hoveredConvSegEl && convHoverTimer) return;
+        hideConvTitleHoverButton();
+        hoveredConvSegEl = convTarget.segEl;
+        convHoverTimer = setTimeout(() => {
+          convHoverTimer = 0;
+          if (disposed || hoveredConvSegEl !== convTarget.segEl || !convTarget.segEl.isConnected) return;
+          const fresh = findConversationTitleTargets().find(t => t.segEl === convTarget.segEl) || convTarget;
+          if (!resolvePendingConvTitleSource(fresh, getEffectiveTargetLang(settings))) return;
+          showConvTitleHoverButton(fresh);
+        }, HOVER_DWELL_MS);
+        return;
+      }
+      if (hoveredConvSegEl || activeConvHoverSegEl) {
+        hideConvTitleHoverButton();
+      }
+
       const btn = resolveHoverHeaderButton(target);
       if (!btn || isHeaderAlreadyActivated(btn)) {
         if (hoveredHeaderBtn && btn !== hoveredHeaderBtn) {
@@ -3709,8 +4204,15 @@
     };
 
     docMouseOutHandler = ev => {
-      if (disposed || (!hoveredHeaderBtn && !activeHoverTarget)) return;
+      if (disposed) return;
       const rel = ev.relatedTarget && ev.relatedTarget.nodeType === 1 ? ev.relatedTarget : ev.relatedTarget?.parentElement;
+      if (hoveredConvSegEl || activeConvHoverSegEl) {
+        const nextConv = resolveConvTitleHoverTarget(rel);
+        if (!nextConv || (nextConv.segEl !== hoveredConvSegEl && nextConv.segEl !== activeConvHoverSegEl)) {
+          hideConvTitleHoverButton();
+        }
+      }
+      if (!hoveredHeaderBtn && !activeHoverTarget) return;
       const nextBtn = resolveHoverHeaderButton(rel);
       if (nextBtn === hoveredHeaderBtn || (activeHoverTarget && nextBtn === activeHoverTarget)) {
         return;
@@ -3760,6 +4262,7 @@
           if (st) st.manualDismissed = false;
         }
       }
+      scanConversationTitles([], { force: false, manual: true });
       scanStepAndHeaderTitles(targetLang, model, [], true);
       scanThinkingBlocks();
       const validWrappers = Array.from(trackedWrappers).filter(w => w.isConnected);
@@ -3855,6 +4358,17 @@
     if (disposed) return;
     disposed = true;
     hideHoverTranslateButton();
+    convHoverTranslating = false;
+    hideConvTitleHoverButton(true);
+    try { unsubscribeReduxStore?.(); } catch {}
+    unsubscribeReduxStore = null;
+    cachedReduxStore = null;
+    lastReduxSummarySig = '';
+    for (const st of convTitleStates.values()) {
+      if (st.activeTaskKey) detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+    }
+    convTitleStates.clear();
+    knownTranslatedConvTitles.clear();
     if (scanTimer) clearTimeout(scanTimer);
     if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
@@ -3926,7 +4440,10 @@
     for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
       hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
     }
-    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar')) t.remove();
+    for (const hidden of document.querySelectorAll('[data-ag-tt-conv-orig-hidden]')) {
+      hidden.removeAttribute('data-ag-tt-conv-orig-hidden');
+    }
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar, .ag-tt-conv-title-btn, .ag-tt-conv-title-dom-fallback')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();

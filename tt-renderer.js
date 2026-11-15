@@ -28,6 +28,9 @@
     resolveCascadeSelection,
     shouldTranslateText,
     shouldTranslateTitle,
+    isPlaceholderConversationTitle,
+    shouldTranslateConversationTitle,
+    cleanConversationTitleTranslation,
     translateBoilerplateTitle,
     renderSafeMarkdownHtml,
     renderStreamingMarkdownHtml,
@@ -72,6 +75,14 @@
   let hoverBtnEl = null;
   let activeHoverHost = null;
   let activeHoverTarget = null;
+  let cachedReduxStore = null;
+  let unsubscribeReduxStore = null;
+  let lastReduxSummarySig = '';
+  let convHoverTimer = 0;
+  let hoveredConvSegEl = null;
+  let activeConvHoverSegEl = null;
+  let convHoverBtnEl = null;
+  let convHoverTranslating = false;
   let themeObserver = null;
   let domObserver = null;
   let titlebarResizeObserver = null;
@@ -92,6 +103,8 @@
   const seenToolGroups = new WeakMap(); // buttonEl -> last thinking fingerprint
   const historicalToolGroups = new WeakSet();
   const toolGroupStates = new WeakMap(); // buttonEl -> Array<FiberBlockState>
+  const convTitleStates = new Map(); // stateKey -> ConvTitleState
+  const knownTranslatedConvTitles = new Set(); // `${targetLang}\0${title}`
 
   // Client-side canonical memory cache (canonKey -> translation) & negative check cache
   const memCache = new Map();
@@ -106,7 +119,7 @@
   const activeTasks = new Map(); // taskKey -> Task
 
   const TT_STYLES = ":host {\r\n  all: initial;\r\n  display: inline-flex;\r\n  align-items: center;\r\n  position: relative;\r\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\r\n  color: var(--tt-text);\r\n  -webkit-app-region: no-drag;\r\n  margin-right: 6px;\r\n  --tt-bg: rgba(255, 255, 255, 0.94);\r\n  --tt-bg-elevated: #ffffff;\r\n  --tt-bg-sub: #f4f5f7;\r\n  --tt-border: rgba(15, 23, 42, 0.12);\r\n  --tt-text: #111827;\r\n  --tt-text-muted: #6b7280;\r\n  --tt-accent: #438780;\r\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\r\n  --tt-accent-text: #2f6f68;\r\n  --tt-success: #438780;\r\n  --tt-warn: #f59e0b;\r\n  --tt-danger: #ef4444;\r\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\r\n}\r\n\r\n:host([data-theme=\"dark\"]) {\r\n  --tt-bg: rgba(28, 30, 36, 0.94);\r\n  --tt-bg-elevated: #1e2028;\r\n  --tt-bg-sub: #272a34;\r\n  --tt-border: rgba(255, 255, 255, 0.12);\r\n  --tt-text: #f3f4f6;\r\n  --tt-text-muted: #9ca3af;\r\n  --tt-accent: #6ab0a8;\r\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\r\n  --tt-accent-text: #8ccac2;\r\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\r\n}\r\n\r\n:host([data-dock=\"fixed\"]) {\r\n  position: fixed;\r\n  top: 8px;\r\n  right: 260px;\r\n  z-index: 9998;\r\n}\r\n\r\n.tt-capsule {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  gap: 5px;\r\n  height: 24px;\r\n  padding: 0 9px;\r\n  border-radius: 999px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  line-height: 1;\r\n  cursor: pointer;\r\n  user-select: none;\r\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\r\n  white-space: nowrap;\r\n}\r\n\r\n.tt-capsule:hover {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n}\r\n\r\n.tt-capsule[aria-expanded=\"true\"] {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n}\r\n\r\n.tt-dot {\r\n  width: 6px;\r\n  height: 6px;\r\n  border-radius: 50%;\r\n  background: var(--tt-text-muted);\r\n  flex-shrink: 0;\r\n}\r\n\r\n.tt-capsule[data-state=\"active\"] .tt-dot {\r\n  background: var(--tt-accent);\r\n}\r\n\r\n.tt-capsule[data-state=\"translating\"] .tt-dot {\r\n  background: var(--tt-accent);\r\n  animation: tt-pulse 1s ease-in-out infinite;\r\n}\r\n\r\n.tt-capsule[data-state=\"error\"] .tt-dot {\r\n  background: var(--tt-danger);\r\n}\r\n\r\n@keyframes tt-pulse {\r\n  0%, 100% { opacity: 1; transform: scale(1); }\r\n  50% { opacity: 0.45; transform: scale(0.8); }\r\n}\r\n\r\n.tt-popover {\r\n  position: fixed;\r\n  top: 42px;\r\n  right: 16px;\r\n  width: 344px;\r\n  max-width: calc(100vw - 24px);\r\n  background: var(--tt-bg-elevated);\r\n  border: 1px solid var(--tt-border);\r\n  border-radius: 12px;\r\n  box-shadow: var(--tt-shadow);\r\n  padding: 14px;\r\n  z-index: 2147483000;\r\n  display: none;\r\n  box-sizing: border-box;\r\n  font-size: 12px;\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-popover[data-open=\"true\"] {\r\n  display: block;\r\n}\r\n\r\n.tt-header {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  margin-bottom: 12px;\r\n  padding-bottom: 8px;\r\n  border-bottom: 1px solid var(--tt-border);\r\n}\r\n\r\n.tt-title-wrap {\r\n  display: flex;\r\n  align-items: center;\r\n  gap: 6px;\r\n  font-size: 13px;\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-version {\r\n  font-size: 10px;\r\n  padding: 1px 5px;\r\n  border-radius: 999px;\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-close {\r\n  border: none;\r\n  background: transparent;\r\n  color: var(--tt-text-muted);\r\n  cursor: pointer;\r\n  font-size: 15px;\r\n  line-height: 1;\r\n  padding: 2px 5px;\r\n  border-radius: 6px;\r\n}\r\n\r\n.tt-close:hover {\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-row {\r\n  margin-bottom: 10px;\r\n}\r\n\r\n.tt-row-inline {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: 8px;\r\n  margin-bottom: 10px;\r\n}\r\n\r\n.tt-label {\r\n  display: block;\r\n  font-size: 11px;\r\n  color: var(--tt-text-muted);\r\n  margin-bottom: 4px;\r\n  font-weight: 500;\r\n}\r\n\r\n.tt-label-inline {\r\n  font-size: 12px;\r\n  color: var(--tt-text);\r\n  font-weight: 500;\r\n}\r\n\r\n.tt-row-sub {\r\n  margin-top: -2px;\r\n  margin-bottom: 10px;\r\n  transition: opacity 140ms ease;\r\n}\r\n\r\n.tt-row-sub[data-disabled=\"true\"] {\r\n  opacity: 0.46;\r\n  pointer-events: none;\r\n}\r\n\r\n.tt-label-stack {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 2px;\r\n  min-width: 0;\r\n}\r\n\r\n.tt-row-sub .tt-label-inline {\r\n  font-size: 11.5px;\r\n  font-weight: 400;\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-subhint {\r\n  font-size: 10.5px;\r\n  line-height: 1.25;\r\n  color: var(--tt-text-muted);\r\n}\r\n\r\n.tt-select,\r\n.tt-input {\r\n  width: 100%;\r\n  box-sizing: border-box;\r\n  padding: 6px 8px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 12px;\r\n  outline: none;\r\n}\r\n\r\n.tt-select:focus,\r\n.tt-input:focus {\r\n  border-color: var(--tt-accent);\r\n}\r\n\r\n.tt-input-wrap {\r\n  margin-top: 6px;\r\n  display: none;\r\n}\r\n\r\n.tt-input-wrap[data-visible=\"true\"] {\r\n  display: block;\r\n}\r\n\r\n.tt-label-bar {\r\n  display: flex;\r\n  align-items: center;\r\n  justify-content: space-between;\r\n  gap: 8px;\r\n  margin-bottom: 4px;\r\n}\r\n\r\n.tt-label-bar .tt-label {\r\n  margin-bottom: 0;\r\n}\r\n\r\n.tt-link-btn {\r\n  border: none;\r\n  background: transparent;\r\n  padding: 1px 4px;\r\n  border-radius: 5px;\r\n  font-size: 11px;\r\n  font-weight: 500;\r\n  color: var(--tt-accent-text);\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-link-btn:hover {\r\n  background: var(--tt-accent-soft);\r\n}\r\n\r\n.tt-link-btn:disabled {\r\n  opacity: 0.55;\r\n  cursor: default;\r\n}\r\n\r\n.tt-model-cascade {\r\n  display: grid;\r\n  grid-template-columns: 1.35fr 1fr;\r\n  gap: 6px;\r\n  align-items: end;\r\n}\r\n\r\n.tt-cascade-col {\r\n  display: flex;\r\n  flex-direction: column;\r\n  gap: 3px;\r\n  min-width: 0;\r\n}\r\n\r\n.tt-sublabel {\r\n  font-size: 10.5px;\r\n  color: var(--tt-text-muted);\r\n  line-height: 1.2;\r\n}\r\n\r\n.tt-seg {\r\n  display: grid;\r\n  grid-template-columns: 1fr 1fr;\r\n  gap: 4px;\r\n  padding: 3px;\r\n  border-radius: 8px;\r\n  background: var(--tt-bg-sub);\r\n  border: 1px solid var(--tt-border);\r\n}\r\n\r\n.tt-seg-btn {\r\n  border: none;\r\n  border-radius: 6px;\r\n  padding: 5px 8px;\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  cursor: pointer;\r\n  background: transparent;\r\n  color: var(--tt-text-muted);\r\n  transition: background-color 120ms ease, color 120ms ease;\r\n}\r\n\r\n.tt-seg-btn[data-active=\"true\"] {\r\n  background: var(--tt-accent);\r\n  color: #ffffff;\r\n}\r\n\r\n.tt-swatches {\r\n  display: grid;\r\n  grid-template-columns: repeat(3, minmax(0, 1fr));\r\n  gap: 6px;\r\n}\r\n\r\n.tt-swatch-btn {\r\n  display: inline-flex;\r\n  align-items: center;\r\n  justify-content: center;\r\n  gap: 5px;\r\n  min-width: 0;\r\n  padding: 6px 8px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text-muted);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  line-height: 1;\r\n  cursor: pointer;\r\n  white-space: nowrap;\r\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\r\n}\r\n\r\n.tt-swatch-btn:hover {\r\n  border-color: var(--tt-accent);\r\n  color: var(--tt-text);\r\n}\r\n\r\n.tt-swatch-btn[data-active=\"true\"] {\r\n  border-color: var(--tt-accent);\r\n  background: var(--tt-accent-soft);\r\n  color: var(--tt-accent-text);\r\n  font-weight: 600;\r\n}\r\n\r\n.tt-swatch-dot {\r\n  width: 8px;\r\n  height: 8px;\r\n  border-radius: 50%;\r\n  flex-shrink: 0;\r\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\r\n}\r\n\r\n.tt-switch {\r\n  position: relative;\r\n  display: inline-flex;\r\n  align-items: center;\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-switch input {\r\n  position: absolute;\r\n  opacity: 0;\r\n  width: 0;\r\n  height: 0;\r\n}\r\n\r\n.tt-slider {\r\n  width: 34px;\r\n  height: 18px;\r\n  border-radius: 999px;\r\n  background: var(--tt-border);\r\n  position: relative;\r\n  transition: background-color 140ms ease;\r\n}\r\n\r\n.tt-slider::after {\r\n  content: \"\";\r\n  position: absolute;\r\n  top: 2px;\r\n  left: 2px;\r\n  width: 14px;\r\n  height: 14px;\r\n  border-radius: 50%;\r\n  background: #ffffff;\r\n  transition: transform 140ms ease;\r\n}\r\n\r\n.tt-switch input:checked + .tt-slider {\r\n  background: var(--tt-accent);\r\n}\r\n\r\n.tt-switch input:checked + .tt-slider::after {\r\n  transform: translateX(16px);\r\n}\r\n\r\n.tt-actions {\r\n  display: grid;\r\n  grid-template-columns: 1fr 1fr;\r\n  gap: 8px;\r\n  margin-top: 10px;\r\n}\r\n\r\n.tt-btn {\r\n  padding: 6px 10px;\r\n  border-radius: 7px;\r\n  border: 1px solid var(--tt-border);\r\n  background: var(--tt-bg-sub);\r\n  color: var(--tt-text);\r\n  font-size: 11.5px;\r\n  font-weight: 500;\r\n  cursor: pointer;\r\n}\r\n\r\n.tt-btn:hover {\r\n  border-color: var(--tt-accent);\r\n}\r\n\r\n.tt-btn-primary {\r\n  background: var(--tt-accent);\r\n  border-color: var(--tt-accent);\r\n  color: #ffffff;\r\n}\r\n\r\n.tt-btn-primary:hover {\r\n  filter: brightness(1.06);\r\n}\r\n\r\n.tt-footer {\r\n  margin-top: 10px;\r\n  padding-top: 8px;\r\n  border-top: 1px solid var(--tt-border);\r\n  font-size: 11px;\r\n  color: var(--tt-text-muted);\r\n  display: flex;\r\n  justify-content: space-between;\r\n  align-items: center;\r\n  gap: 8px;\r\n}\r\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\r\n  <span class=\"tt-dot\"></span>\r\n  <span id=\"tt-capsule-label\">翻译 · 简体中文</span>\r\n</button>\r\n\r\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\r\n  <div class=\"tt-header\">\r\n    <div class=\"tt-title-wrap\">\r\n      <span>思考过程翻译</span>\r\n      <span id=\"tt-version\" class=\"tt-version\">v0.4.2</span>\r\n    </div>\r\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\r\n  </div>\r\n\r\n  <div class=\"tt-row-inline\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\r\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\r\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\r\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\r\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\r\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">显示方式</span>\r\n    <div class=\"tt-seg\">\r\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\r\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\r\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <div class=\"tt-label-bar\">\r\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\r\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\r\n    </div>\r\n    <div class=\"tt-model-cascade\">\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">模型</span>\r\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\r\n      </div>\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">思考等级</span>\r\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\r\n      </div>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-actions\">\r\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\r\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\r\n  </div>\r\n\r\n  <div class=\"tt-footer\">\r\n    <span id=\"tt-status-text\">就绪</span>\r\n    <span id=\"tt-cache-stats\">缓存: 0</span>\r\n  </div>\r\n</div>\r\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\r\n  <span class=\"tt-dot\"></span>\r\n  <span id=\"tt-capsule-label\">翻译 · 简体中文</span>\r\n</button>\r\n\r\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\r\n  <div class=\"tt-header\">\r\n    <div class=\"tt-title-wrap\">\r\n      <span>思考过程翻译</span>\r\n      <span id=\"tt-version\" class=\"tt-version\">v0.5.0</span>\r\n    </div>\r\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\r\n  </div>\r\n\r\n  <div class=\"tt-row-inline\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\r\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\r\n    <div class=\"tt-label-stack\">\r\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\r\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\r\n    </div>\r\n    <label class=\"tt-switch\">\r\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\r\n      <span class=\"tt-slider\"></span>\r\n    </label>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\r\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\r\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\r\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">显示方式</span>\r\n    <div class=\"tt-seg\">\r\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\r\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\r\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\r\n  </div>\r\n\r\n  <div class=\"tt-row\">\r\n    <div class=\"tt-label-bar\">\r\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\r\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\r\n    </div>\r\n    <div class=\"tt-model-cascade\">\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">模型</span>\r\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\r\n      </div>\r\n      <div class=\"tt-cascade-col\">\r\n        <span class=\"tt-sublabel\">思考等级</span>\r\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\r\n      </div>\r\n    </div>\r\n  </div>\r\n\r\n  <div class=\"tt-actions\">\r\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\r\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\r\n  </div>\r\n\r\n  <div class=\"tt-footer\">\r\n    <span id=\"tt-status-text\">就绪</span>\r\n    <span id=\"tt-cache-stats\">缓存: 0</span>\r\n  </div>\r\n</div>\r\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -474,6 +487,49 @@
         background: var(--ag-tt-accent, #438780);
         border-color: var(--ag-tt-accent, #438780);
         color: #ffffff;
+      }
+      .ag-tt-conv-title-btn {
+        flex-shrink: 0;
+        margin-left: 6px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: 22px;
+        padding: 0 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        line-height: 1;
+        font-weight: 500;
+        white-space: nowrap;
+        cursor: pointer;
+        user-select: none;
+        -webkit-app-region: no-drag;
+        app-region: no-drag;
+        backdrop-filter: blur(6px);
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
+        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        color: var(--ag-tt-accent-text, #2f6f68);
+        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        animation: agTtHoverIn 140ms ease-out both;
+        transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+      }
+      .ag-tt-conv-title-btn:hover:not([disabled]) {
+        background: var(--ag-tt-accent, #438780);
+        border-color: var(--ag-tt-accent, #438780);
+        color: #ffffff;
+      }
+      .ag-tt-conv-title-btn[data-status="translating"] {
+        cursor: default;
+        opacity: 0.85;
+        animation: agTtPulse 1.2s ease-in-out infinite;
+      }
+      .ag-tt-conv-title-btn[data-status="error"] {
+        color: #ef4444;
+        background: rgba(239, 68, 68, 0.12);
+        border-color: rgba(239, 68, 68, 0.28);
+      }
+      [data-ag-tt-conv-orig-hidden="1"] {
+        display: none !important;
       }
       @keyframes agTtHoverIn {
         from { opacity: 0; transform: scale(0.95); }
@@ -876,6 +932,13 @@
     if (clearMem) {
       memCache.clear();
       checkedCanonMisses.clear();
+      knownTranslatedConvTitles.clear();
+      for (const st of convTitleStates.values()) {
+        if (st.activeTaskKey) {
+          detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+        }
+      }
+      convTitleStates.clear();
     }
     clearQueuedTasks();
 
@@ -967,6 +1030,7 @@
 
   function deactivateAllToVanilla() {
     hideHoverTranslateButton();
+    hideConvTitleHoverButton();
     resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
@@ -979,6 +1043,10 @@
       deactivateAllToVanilla();
     } else if (!prevEnabled && settings.enabled) {
       hideHoverTranslateButton();
+      hideConvTitleHoverButton();
+      for (const st of convTitleStates.values()) {
+        st.failedSourceKey = '';
+      }
       for (const wrapper of trackedWrappers) {
         const st = blockStates.get(wrapper);
         if (st) st.manualDismissed = false;
@@ -2573,6 +2641,326 @@
     }
   }
 
+  let lastObservedCascadeId = '';
+
+  function ensureReduxStoreSubscribed(probeEl) {
+    if (cachedReduxStore || !probeEl) return cachedReduxStore;
+    let cur = getReactFiber(probeEl);
+    for (let i = 0; i < 220 && cur; i++) {
+      const p = cur.memoizedProps;
+      const candidate = p?.value?.store || p?.store;
+      if (candidate && typeof candidate.getState === 'function' && typeof candidate.subscribe === 'function') {
+        cachedReduxStore = candidate;
+        try {
+          unsubscribeReduxStore = candidate.subscribe(() => {
+            if (disposed || !cachedReduxStore) return;
+            try {
+              const m = location.pathname.match(/^\/c\/([^/?#]+)/);
+              const cid = (m && m[1]) || lastObservedCascadeId;
+              const sumObj = cid ? cachedReduxStore.getState()?.trajectorySummaries?.summaries?.[cid] : null;
+              const sig = `${cid || ''}\0${sumObj?.summary || ''}\0${sumObj?.annotations?.title || ''}`;
+              if (sig !== lastReduxSummarySig) {
+                lastReduxSummarySig = sig;
+                scheduleFastTitleSync();
+              }
+            } catch {}
+          });
+        } catch {}
+        return cachedReduxStore;
+      }
+      cur = cur.return;
+    }
+    return null;
+  }
+
+  function findConversationTitleTargets() {
+    const targets = [];
+    const titlebars = document.querySelectorAll('[class*="@container/titlebar"]');
+    for (let tbIdx = 0; tbIdx < titlebars.length; tbIdx++) {
+      const titlebar = titlebars[tbIdx];
+      if (!titlebar || !titlebar.isConnected) continue;
+      const segs = Array.from(titlebar.querySelectorAll('[data-testid="breadcrumb-segment"]'));
+      if (!segs.length) continue;
+
+      let chosen = null;
+      for (const segEl of segs) {
+        let onRename = null;
+        let fiberName = '';
+        let isEditing = false;
+        let cascadeId = '';
+        let cur = getReactFiber(segEl);
+        for (let i = 0; i < 16 && cur; i++) {
+          const p = cur.memoizedProps;
+          if (p && typeof p === 'object') {
+            if (!onRename && typeof p.onRename === 'function') {
+              onRename = p.onRename;
+              if (typeof p.name === 'string') fiberName = p.name;
+              if (p.isEditing !== undefined) isEditing = Boolean(p.isEditing);
+            }
+            if (!cascadeId && typeof p.cascadeId === 'string' && p.cascadeId) {
+              cascadeId = p.cascadeId;
+            }
+          }
+          if (onRename && cascadeId) break;
+          cur = cur.return;
+        }
+        if (onRename) {
+          chosen = { segEl, onRename, fiberName, isEditing, cascadeId };
+          break;
+        }
+      }
+
+      if (!chosen) {
+        const pathMatch = location.pathname.match(/^\/c\/([^/?#]+)/);
+        const fallbackSeg = segs.length >= 2
+          ? segs[segs.length - 1]
+          : (segs[0] && document.title.startsWith(readVisibleDomText(segs[0], '').replace(/\s+/g, ' ').trim()) ? segs[0] : null);
+        if (fallbackSeg && pathMatch && pathMatch[1]) {
+          chosen = {
+            segEl: fallbackSeg,
+            onRename: null,
+            fiberName: '',
+            isEditing: false,
+            cascadeId: pathMatch[1]
+          };
+        }
+      }
+
+      if (!chosen || !chosen.segEl || !chosen.segEl.isConnected) continue;
+      ensureReduxStoreSubscribed(chosen.segEl);
+      if (chosen.cascadeId) lastObservedCascadeId = chosen.cascadeId;
+
+      let storeSummary = '';
+      let storeAnnotationsTitle = '';
+      try {
+        const sumObj = chosen.cascadeId
+          ? cachedReduxStore?.getState?.()?.trajectorySummaries?.summaries?.[chosen.cascadeId]
+          : null;
+        if (typeof sumObj?.summary === 'string') storeSummary = sumObj.summary.replace(/\s+/g, ' ').trim();
+        if (typeof sumObj?.annotations?.title === 'string') storeAnnotationsTitle = sumObj.annotations.title.replace(/\s+/g, ' ').trim();
+      } catch {}
+
+      const domText = readVisibleDomText(chosen.segEl, '').replace(/\s+/g, ' ').trim();
+      const currentTitle = storeAnnotationsTitle || storeSummary || chosen.fiberName || domText;
+      const stateKey = chosen.cascadeId || `tb-${tbIdx}`;
+      const sig = `${chosen.cascadeId || ''}\0${storeSummary}\0${storeAnnotationsTitle}`;
+      if (sig && sig !== lastReduxSummarySig && chosen.cascadeId) {
+        lastReduxSummarySig = sig;
+      }
+
+      targets.push({
+        titlebar,
+        segEl: chosen.segEl,
+        hostEl: chosen.segEl.parentElement,
+        stateKey,
+        cascadeId: chosen.cascadeId,
+        onRename: chosen.onRename,
+        isEditing: chosen.isEditing || Boolean(chosen.segEl.querySelector('input, textarea')),
+        currentTitle,
+        storeSummary,
+        storeAnnotationsTitle,
+        domText
+      });
+    }
+    return targets;
+  }
+
+  function resolvePendingConvTitleSource(target, targetLang, opts = {}) {
+    if (!target || !target.segEl?.isConnected || target.isEditing) return null;
+    const st = convTitleStates.get(target.stateKey);
+    const cand = target.currentTitle;
+    if (cand && !isPlaceholderConversationTitle(cand)) {
+      if (opts.force || (!knownTranslatedConvTitles.has(`${targetLang}\0${cand}`) && shouldTranslateConversationTitle(cand, targetLang))) {
+        return cand;
+      }
+    }
+    if (
+      st &&
+      target.storeSummary &&
+      target.storeSummary !== st.lastTranslatedSummary &&
+      (!target.storeAnnotationsTitle || target.storeAnnotationsTitle === st.lastAppliedTitle)
+    ) {
+      if (
+        !isPlaceholderConversationTitle(target.storeSummary) &&
+        !knownTranslatedConvTitles.has(`${targetLang}\0${target.storeSummary}`) &&
+        shouldTranslateConversationTitle(target.storeSummary, targetLang)
+      ) {
+        return target.storeSummary;
+      }
+    }
+    return null;
+  }
+
+  async function applyConversationTitleReplacement(target, cleanTitle) {
+    if (!cleanTitle || !target || !target.segEl?.isConnected) return false;
+    for (const old of target.segEl.querySelectorAll('.ag-tt-conv-title-dom-fallback')) {
+      old.remove();
+    }
+    for (const hidden of target.segEl.querySelectorAll('[data-ag-tt-conv-orig-hidden]')) {
+      hidden.removeAttribute('data-ag-tt-conv-orig-hidden');
+    }
+
+    if (typeof target.onRename === 'function') {
+      try {
+        await target.onRename(cleanTitle);
+        return true;
+      } catch {}
+    }
+
+    const origSpan = Array.from(target.segEl.children).find(c => !c.hasAttribute('data-ag-tt-ui'));
+    if (origSpan) {
+      origSpan.setAttribute('data-ag-tt-conv-orig-hidden', '1');
+      const fallbackEl = document.createElement('span');
+      fallbackEl.className = 'truncate inline-block ag-tt-conv-title-dom-fallback';
+      fallbackEl.setAttribute('data-ag-tt-ui', '1');
+      fallbackEl.textContent = cleanTitle;
+      origSpan.insertAdjacentElement('afterend', fallbackEl);
+    } else {
+      target.segEl.textContent = cleanTitle;
+    }
+
+    if (target.domText && document.title.startsWith(target.domText)) {
+      document.title = cleanTitle + document.title.slice(target.domText.length);
+    }
+    return true;
+  }
+
+  async function triggerConversationTitleTranslation(target, opts = {}) {
+    if (disposed || !target || !target.segEl?.isConnected) return;
+    const targetLang = getEffectiveTargetLang(settings);
+    const model = settings.model || DEFAULT_MODEL;
+    const sourceText = resolvePendingConvTitleSource(target, targetLang, opts);
+    if (!sourceText) {
+      convHoverTranslating = false;
+      hideConvTitleHoverButton();
+      return;
+    }
+
+    const stateKey = target.stateKey;
+    let st = convTitleStates.get(stateKey);
+    if (!st) {
+      st = {
+        status: 'idle',
+        activeSourceKey: '',
+        activeTaskKey: '',
+        activeSubscriber: null,
+        lastTranslatedSource: '',
+        lastTranslatedSummary: '',
+        lastAppliedTitle: '',
+        lastTargetLang: '',
+        failedSourceKey: ''
+      };
+      convTitleStates.set(stateKey, st);
+    }
+
+    const sourceKey = `${targetLang}\0${sourceText}`;
+    if (!opts.force && !opts.manual && (st.status === 'queued' || st.status === 'translating') && st.activeSourceKey === sourceKey) {
+      return;
+    }
+    if (!opts.force && !opts.manual && st.failedSourceKey === sourceKey) {
+      return;
+    }
+
+    if (st.activeTaskKey) {
+      detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+      st.activeTaskKey = '';
+      st.activeSubscriber = null;
+    }
+
+    if (opts.manual && !opts.force) {
+      await prewarmBackendCache([{ text: sourceText }], targetLang, model, { skipScan: true });
+      if (disposed) return;
+    }
+
+    st.status = 'queued';
+    st.activeSourceKey = sourceKey;
+    st.failedSourceKey = '';
+
+    const subscriber = {
+      onStart: () => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.status = 'translating';
+      },
+      onDone: (finalText, _cached) => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.activeTaskKey = '';
+        st.activeSubscriber = null;
+        const cleanTitle = cleanConversationTitleTranslation(finalText);
+        if (!cleanTitle) {
+          st.status = 'error';
+          st.failedSourceKey = sourceKey;
+          convHoverTranslating = false;
+          if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+            convHoverBtnEl.disabled = false;
+            convHoverBtnEl.setAttribute('data-status', 'error');
+            convHoverBtnEl.textContent = '翻译失败';
+          }
+          return;
+        }
+        st.status = 'done';
+        st.lastTranslatedSource = sourceText;
+        st.lastTranslatedSummary = target.storeSummary || sourceText;
+        st.lastAppliedTitle = cleanTitle;
+        st.lastTargetLang = targetLang;
+        st.failedSourceKey = '';
+        knownTranslatedConvTitles.add(`${targetLang}\0${sourceText}`);
+        knownTranslatedConvTitles.add(`${targetLang}\0${cleanTitle}`);
+
+        convHoverTranslating = false;
+        hideConvTitleHoverButton();
+
+        const liveTarget = findConversationTitleTargets().find(t => t.stateKey === stateKey) || target;
+        if (cleanTitle !== liveTarget.currentTitle) {
+          void applyConversationTitleReplacement(liveTarget, cleanTitle);
+        }
+      },
+      onError: _errMsg => {
+        if (disposed || st.activeSourceKey !== sourceKey) return;
+        st.activeTaskKey = '';
+        st.activeSubscriber = null;
+        st.status = 'error';
+        st.failedSourceKey = sourceKey;
+        convHoverTranslating = false;
+        if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+          convHoverBtnEl.disabled = false;
+          convHoverBtnEl.setAttribute('data-status', 'error');
+          convHoverBtnEl.textContent = '翻译失败';
+        }
+      }
+    };
+
+    const snap = opts.manual ? captureQueueSnapshot() : null;
+    st.activeSubscriber = subscriber;
+    st.activeTaskKey = enqueueTranslationTask({
+      text: sourceText,
+      targetLang,
+      model,
+      force: Boolean(opts.force),
+      priority: 'title',
+      subscriber
+    }) || '';
+    if (opts.manual && st.activeTaskKey) {
+      promoteNewQueueTasksToFront(snap);
+      flushSchedulerBatches();
+    }
+  }
+
+  function scanConversationTitles(prewarmItems = [], opts = {}) {
+    if (disposed) return;
+    const targetLang = getEffectiveTargetLang(settings);
+    const targets = findConversationTitleTargets();
+    for (const target of targets) {
+      const sourceText = resolvePendingConvTitleSource(target, targetLang, opts);
+      if (!sourceText) continue;
+      if (Array.isArray(prewarmItems)) {
+        prewarmItems.push({ text: sourceText });
+      }
+      if (settings.enabled || opts.manual) {
+        void triggerConversationTitleTranslation(target, opts);
+      }
+    }
+  }
+
   function startDomParaTranslation(wrapper, st, p, targetLang, model, force, priority) {
     const activeCanon = p.canonKey;
     st.hasStartedTranslation = true;
@@ -3233,13 +3621,97 @@
 
   function resolveHoverHeaderButton(node) {
     if (!node || node.nodeType !== 1) return null;
-    if (node.closest('#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], .ag-tt-trigger-bar, .ag-tt-group-bar')) {
+    if (node.closest('#ag-thinking-translator, #ag-context-meter, [role="dialog"], [role="menu"], [role="listbox"], .ag-tt-trigger-bar, .ag-tt-group-bar, .ag-tt-conv-title-btn')) {
       return null;
     }
     if (node.closest('.ag-tt-hover-translate-btn')) {
       return activeHoverTarget || hoveredHeaderBtn;
     }
     return node.closest(HOVER_HEADER_SELECTOR);
+  }
+
+  function hideConvTitleHoverButton(force = false) {
+    if (convHoverTimer) {
+      clearTimeout(convHoverTimer);
+      convHoverTimer = 0;
+    }
+    if (convHoverTranslating && !force) return;
+    hoveredConvSegEl = null;
+    activeConvHoverSegEl = null;
+    if (convHoverBtnEl && convHoverBtnEl.isConnected) {
+      convHoverBtnEl.remove();
+    }
+  }
+
+  function resolveConvTitleHoverTarget(node) {
+    if (!node || node.nodeType !== 1) return null;
+    if (node.closest('.ag-tt-conv-title-btn')) {
+      const seg = activeConvHoverSegEl || hoveredConvSegEl;
+      if (!seg || !seg.isConnected) return null;
+      const targets = findConversationTitleTargets();
+      return targets.find(t => t.segEl === seg) || null;
+    }
+    const titlebar = node.closest('[class*="@container/titlebar"]');
+    if (!titlebar) return null;
+    if (node.closest('#ag-thinking-translator, #ag-context-meter, [data-testid="pane-titlebar-toolbar"], [role="dialog"], [role="menu"], [role="listbox"], button')) {
+      return null;
+    }
+    const targetLang = getEffectiveTargetLang(settings);
+    const targets = findConversationTitleTargets().filter(t => t.titlebar === titlebar);
+    for (const t of targets) {
+      const strip = t.hostEl?.parentElement;
+      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node)) || (strip && strip.contains(node));
+      if (!hitSeg) continue;
+      if (!resolvePendingConvTitleSource(t, targetLang)) continue;
+      const st = convTitleStates.get(t.stateKey);
+      if (!settings.enabled || st?.status === 'error') {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  function showConvTitleHoverButton(target) {
+    if (disposed || !target || !target.segEl?.isConnected) return;
+    const hostEl = target.hostEl;
+    if (!hostEl || !hostEl.isConnected) return;
+
+    if (!convHoverBtnEl) {
+      convHoverBtnEl = document.createElement('button');
+      convHoverBtnEl.type = 'button';
+      convHoverBtnEl.className = 'ag-tt-conv-title-btn';
+      convHoverBtnEl.setAttribute('data-ag-tt-ui', '1');
+      convHoverBtnEl.title = '翻译当前会话标题并替换';
+      const stop = ev => ev.stopPropagation();
+      convHoverBtnEl.addEventListener('pointerdown', stop);
+      convHoverBtnEl.addEventListener('mousedown', stop);
+      convHoverBtnEl.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (convHoverTranslating) return;
+        const seg = activeConvHoverSegEl;
+        const currentTarget = (seg && findConversationTitleTargets().find(t => t.segEl === seg)) || null;
+        if (!currentTarget) {
+          hideConvTitleHoverButton(true);
+          return;
+        }
+        convHoverTranslating = true;
+        convHoverBtnEl.disabled = true;
+        convHoverBtnEl.setAttribute('data-status', 'translating');
+        convHoverBtnEl.textContent = '翻译中...';
+        void triggerConversationTitleTranslation(currentTarget, { force: false, manual: true });
+      });
+    }
+
+    if (!convHoverTranslating) {
+      convHoverBtnEl.disabled = false;
+      convHoverBtnEl.removeAttribute('data-status');
+      convHoverBtnEl.textContent = '翻译';
+    }
+    activeConvHoverSegEl = target.segEl;
+    if (convHoverBtnEl.parentElement !== hostEl) {
+      hostEl.appendChild(convHoverBtnEl);
+    }
   }
 
   async function triggerManualRegionTranslation(targetBtn, force = false) {
@@ -3462,7 +3934,8 @@
     const model = settings.model || DEFAULT_MODEL;
     const prewarmItems = [];
 
-    // Priority 0: Always translate allowed group headers & step titles FIRST
+    // Priority 0: Always translate allowed group headers, step titles & conversation title FIRST
+    scanConversationTitles(prewarmItems, { force: false, manual: false });
     scanStepAndHeaderTitles(targetLang, model, prewarmItems, false);
 
     const triggers = Array.from(document.querySelectorAll('[data-testid="thinking-collapsible-trigger"]'));
@@ -3540,6 +4013,7 @@
     titleSyncRaf = requestAnimationFrame(() => {
       titleSyncRaf = 0;
       if (disposed) return;
+      scanConversationTitles([], { force: false, manual: false });
       scanStepAndHeaderTitles(getEffectiveTargetLang(settings), settings.model || DEFAULT_MODEL, [], false);
     });
   }
@@ -3690,6 +4164,27 @@
     docMouseOverHandler = ev => {
       if (disposed) return;
       const target = ev.target && ev.target.nodeType === 1 ? ev.target : ev.target?.parentElement;
+
+      const convTarget = resolveConvTitleHoverTarget(target);
+      if (convTarget) {
+        if (hoveredHeaderBtn || activeHoverTarget) hideHoverTranslateButton();
+        if (convTarget.segEl === activeConvHoverSegEl) return;
+        if (convTarget.segEl === hoveredConvSegEl && convHoverTimer) return;
+        hideConvTitleHoverButton();
+        hoveredConvSegEl = convTarget.segEl;
+        convHoverTimer = setTimeout(() => {
+          convHoverTimer = 0;
+          if (disposed || hoveredConvSegEl !== convTarget.segEl || !convTarget.segEl.isConnected) return;
+          const fresh = findConversationTitleTargets().find(t => t.segEl === convTarget.segEl) || convTarget;
+          if (!resolvePendingConvTitleSource(fresh, getEffectiveTargetLang(settings))) return;
+          showConvTitleHoverButton(fresh);
+        }, HOVER_DWELL_MS);
+        return;
+      }
+      if (hoveredConvSegEl || activeConvHoverSegEl) {
+        hideConvTitleHoverButton();
+      }
+
       const btn = resolveHoverHeaderButton(target);
       if (!btn || isHeaderAlreadyActivated(btn)) {
         if (hoveredHeaderBtn && btn !== hoveredHeaderBtn) {
@@ -3710,8 +4205,15 @@
     };
 
     docMouseOutHandler = ev => {
-      if (disposed || (!hoveredHeaderBtn && !activeHoverTarget)) return;
+      if (disposed) return;
       const rel = ev.relatedTarget && ev.relatedTarget.nodeType === 1 ? ev.relatedTarget : ev.relatedTarget?.parentElement;
+      if (hoveredConvSegEl || activeConvHoverSegEl) {
+        const nextConv = resolveConvTitleHoverTarget(rel);
+        if (!nextConv || (nextConv.segEl !== hoveredConvSegEl && nextConv.segEl !== activeConvHoverSegEl)) {
+          hideConvTitleHoverButton();
+        }
+      }
+      if (!hoveredHeaderBtn && !activeHoverTarget) return;
       const nextBtn = resolveHoverHeaderButton(rel);
       if (nextBtn === hoveredHeaderBtn || (activeHoverTarget && nextBtn === activeHoverTarget)) {
         return;
@@ -3761,6 +4263,7 @@
           if (st) st.manualDismissed = false;
         }
       }
+      scanConversationTitles([], { force: false, manual: true });
       scanStepAndHeaderTitles(targetLang, model, [], true);
       scanThinkingBlocks();
       const validWrappers = Array.from(trackedWrappers).filter(w => w.isConnected);
@@ -3856,6 +4359,17 @@
     if (disposed) return;
     disposed = true;
     hideHoverTranslateButton();
+    convHoverTranslating = false;
+    hideConvTitleHoverButton(true);
+    try { unsubscribeReduxStore?.(); } catch {}
+    unsubscribeReduxStore = null;
+    cachedReduxStore = null;
+    lastReduxSummarySig = '';
+    for (const st of convTitleStates.values()) {
+      if (st.activeTaskKey) detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+    }
+    convTitleStates.clear();
+    knownTranslatedConvTitles.clear();
     if (scanTimer) clearTimeout(scanTimer);
     if (titleSyncRaf) cancelAnimationFrame(titleSyncRaf);
     if (pollTimer) clearInterval(pollTimer);
@@ -3927,7 +4441,10 @@
     for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
       hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
     }
-    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar')) t.remove();
+    for (const hidden of document.querySelectorAll('[data-ag-tt-conv-orig-hidden]')) {
+      hidden.removeAttribute('data-ag-tt-conv-orig-hidden');
+    }
+    for (const t of document.querySelectorAll('.ag-tt-header-title-trans, .ag-tt-step-title-trans, .ag-tt-hover-translate-btn, .ag-tt-group-idle-btn, .ag-tt-group-bar, .ag-tt-conv-title-btn, .ag-tt-conv-title-dom-fallback')) t.remove();
     for (const p of document.querySelectorAll('[data-ag-tt-para]')) p.remove();
     trackedWrappers.clear();
     memCache.clear();
