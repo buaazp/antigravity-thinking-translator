@@ -41,13 +41,13 @@
   const HOST_ID = 'ag-thinking-translator';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
-  const HOVER_DWELL_MS = 60;
+  const HOVER_DWELL_MS = 120;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
   const CLIENT_BATCH_MAX_ITEMS = 12;
   const CLIENT_BATCH_MAX_CHARS = 4200;
-  const HOVER_HEADER_SELECTOR = 'button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
+  const HOVER_HEADER_SELECTOR = 'button[data-testid="thinking-collapsible-trigger"], button[data-testid="tool-group-collapsible"], button[data-testid="worked-for-collapsible"], button[data-testid="progress-updates-collapsible"]';
   const TRANSLATABLE_TAGS = new Set(['P', 'UL', 'OL', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
 
   let settings = normalizeSettings(DEFAULT_SETTINGS);
@@ -313,8 +313,7 @@
         padding-right: 142px;
       }
       [data-ag-tt-manual-group="1"],
-      [data-ag-tt-hover-host="1"],
-      [data-ag-tt-group-idle-expanded="1"] {
+      [data-ag-tt-hover-host="1"] {
         position: relative;
       }
       [data-ag-tt-manual-group="1"][data-ag-tt-has-group-badge="1"] > button[data-testid] {
@@ -335,8 +334,7 @@
       [data-ag-tt-manual-group="1"][data-ag-tt-group-hover="1"][data-ag-tt-group-hover-tools="1"]:hover > button[data-testid] {
         padding-right: 142px;
       }
-      [data-ag-tt-hover-host="1"] > button[data-testid],
-      [data-ag-tt-group-idle-expanded="1"] > button[data-testid] {
+      [data-ag-tt-hover-host="1"] > button[data-testid] {
         padding-right: 68px;
       }
       [data-ag-tt-title-mode="translation_only"] > [data-ag-tt-title-ready="1"] {
@@ -448,8 +446,7 @@
       .ag-tt-group-badge[data-status="idle"] {
         opacity: 0.85;
       }
-      .ag-tt-hover-translate-btn,
-      .ag-tt-group-idle-btn {
+      .ag-tt-hover-translate-btn {
         position: absolute;
         top: 5px;
         right: 26px;
@@ -472,8 +469,7 @@
         animation: agTtHoverIn 140ms ease-out both;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
       }
-      .ag-tt-hover-translate-btn:hover,
-      .ag-tt-group-idle-btn:hover {
+      .ag-tt-hover-translate-btn:hover {
         background: var(--ag-tt-accent, #438780);
         border-color: var(--ag-tt-accent, #438780);
         color: #ffffff;
@@ -1838,6 +1834,14 @@
     }
 
     const allowed = isRegionAllowed(wrapper, st);
+    if (!allowed) {
+      if (bar) bar.style.display = 'none';
+      wrapper.removeAttribute('data-ag-tt-has-badge');
+      wrapper.removeAttribute('data-ag-tt-has-tools');
+      wrapper.removeAttribute('data-ag-tt-bar-hover');
+      wrapper.removeAttribute('data-ag-tt-hover-tools');
+      return;
+    }
     const prog = precomputedProg || computeWrapperProgress(st);
     const trigger = wrapper.querySelector('[data-testid="thinking-collapsible-trigger"]');
     const isExpanded = Boolean(getViewportContainer(wrapper, trigger));
@@ -3167,46 +3171,6 @@
     }
   }
 
-  function syncIdleGroupExpandedButtons() {
-    const groupBtns = document.querySelectorAll(HOVER_HEADER_SELECTOR);
-    const activeHosts = new Set();
-    if (!settings.enabled) {
-      for (const btn of groupBtns) {
-        const hostEl = btn.parentElement;
-        if (!hostEl || !hostEl.isConnected) continue;
-        if (hostEl.hasAttribute('data-ag-tt-manual-group')) continue;
-        if (btn.getAttribute('aria-expanded') !== 'true') continue;
-        activeHosts.add(hostEl);
-        hostEl.setAttribute('data-ag-tt-group-idle-expanded', '1');
-        let idleBtn = hostEl.querySelector(':scope > .ag-tt-group-idle-btn');
-        if (!idleBtn) {
-          idleBtn = document.createElement('button');
-          idleBtn.type = 'button';
-          idleBtn.className = 'ag-tt-group-idle-btn';
-          idleBtn.setAttribute('data-ag-tt-ui', '1');
-          idleBtn.textContent = '翻译';
-          idleBtn.title = '手动翻译该区域内的标题和思考详情';
-          idleBtn.addEventListener('click', ev => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            if (btn.isConnected) {
-              void triggerManualRegionTranslation(btn, false);
-            }
-          });
-          hostEl.appendChild(idleBtn);
-        }
-      }
-    }
-    for (const hostNode of document.querySelectorAll('[data-ag-tt-group-idle-expanded]')) {
-      if (!activeHosts.has(hostNode)) {
-        hostNode.removeAttribute('data-ag-tt-group-idle-expanded');
-        for (const old of hostNode.querySelectorAll(':scope > .ag-tt-group-idle-btn')) {
-          old.remove();
-        }
-      }
-    }
-  }
-
   function hideHoverTranslateButton() {
     if (hoverDwellTimer) {
       clearTimeout(hoverDwellTimer);
@@ -3226,10 +3190,9 @@
   function isHeaderAlreadyActivated(btn) {
     if (!btn || !btn.isConnected) return true;
     const isThinkingTrig = btn.getAttribute('data-testid') === 'thinking-collapsible-trigger';
-    if (isThinkingTrig) return true;
-    if (btn.getAttribute('aria-expanded') === 'true') return true;
     const wrapper = btn.parentElement;
-    return isRegionAllowed(wrapper || btn, null);
+    const st = isThinkingTrig && wrapper ? blockStates.get(wrapper) : null;
+    return isRegionAllowed(wrapper || btn, st);
   }
 
   function showHoverTranslateButton(headerBtn) {
@@ -3561,7 +3524,6 @@
     }
 
     scanCollapsedToolGroups(targetLang, model, prewarmItems);
-    syncIdleGroupExpandedButtons();
 
     if (!initialScanDone) {
       initialScanDone = true;
