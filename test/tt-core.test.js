@@ -8,6 +8,7 @@ test('normalizeSettings preserves defaults and supports custom language, modes &
   const def = core.normalizeSettings({});
   assert.equal(def.enabled, true);
   assert.equal(def.pretranslateCollapsed, false);
+  assert.equal(def.autoTranslateConversationTitle, true);
   assert.equal(def.targetLang, '简体中文');
   assert.equal(def.displayMode, 'bilingual');
   assert.equal(def.model, 'gemini-4-hydrogen-medium');
@@ -21,10 +22,12 @@ test('normalizeSettings preserves defaults and supports custom language, modes &
     model: 'gemini-4-carbon-medium',
     enabled: false,
     pretranslateCollapsed: true,
+    autoTranslateConversationTitle: false,
     colorTheme: 'mist_blue'
   });
   assert.equal(customPreset.enabled, false);
   assert.equal(customPreset.pretranslateCollapsed, true);
+  assert.equal(customPreset.autoTranslateConversationTitle, false);
   assert.equal(customPreset.displayMode, 'translation_only');
   assert.equal(customPreset.colorTheme, 'mist_blue');
   assert.equal(core.getEffectiveTargetLang(customPreset), '粤语');

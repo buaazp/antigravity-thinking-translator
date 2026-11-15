@@ -840,6 +840,10 @@
     if (pretranslateRow) {
       pretranslateRow.setAttribute('data-disabled', settings.enabled ? 'false' : 'true');
     }
+    const convTitleInput = el('tt-auto-translate-conv-title');
+    if (convTitleInput) {
+      convTitleInput.checked = Boolean(settings.autoTranslateConversationTitle);
+    }
 
     const langSelect = el('tt-target-lang');
     if (langSelect) {
@@ -1029,12 +1033,12 @@
 
   function deactivateAllToVanilla() {
     hideHoverTranslateButton();
-    hideConvTitleHoverButton();
     resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
   async function persistSettings(partial) {
     const prevEnabled = settings.enabled;
+    const prevConvAuto = settings.autoTranslateConversationTitle;
     const prevLang = getEffectiveTargetLang(settings);
     const prevModel = settings.model;
     settings = normalizeSettings({ ...settings, ...partial });
@@ -1042,10 +1046,6 @@
       deactivateAllToVanilla();
     } else if (!prevEnabled && settings.enabled) {
       hideHoverTranslateButton();
-      hideConvTitleHoverButton();
-      for (const st of convTitleStates.values()) {
-        st.failedSourceKey = '';
-      }
       for (const wrapper of trackedWrappers) {
         const st = blockStates.get(wrapper);
         if (st) st.manualDismissed = false;
@@ -1062,6 +1062,14 @@
         manualGroupStates.delete(gw);
       }
       trackedManualGroups.clear();
+    }
+    if (prevConvAuto !== settings.autoTranslateConversationTitle) {
+      hideConvTitleHoverButton();
+      if (settings.autoTranslateConversationTitle) {
+        for (const st of convTitleStates.values()) {
+          st.failedSourceKey = '';
+        }
+      }
     }
     renderSettingsUI();
 
@@ -2954,7 +2962,7 @@
       if (Array.isArray(prewarmItems)) {
         prewarmItems.push({ text: sourceText });
       }
-      if (settings.enabled || opts.manual) {
+      if (settings.autoTranslateConversationTitle || opts.manual) {
         void triggerConversationTitleTranslation(target, opts);
       }
     }
@@ -3663,7 +3671,7 @@
       if (!hitSeg) continue;
       if (!resolvePendingConvTitleSource(t, targetLang)) continue;
       const st = convTitleStates.get(t.stateKey);
-      if (!settings.enabled || st?.status === 'error') {
+      if (!settings.autoTranslateConversationTitle || st?.status === 'error') {
         return t;
       }
     }
@@ -4095,6 +4103,10 @@
 
     el('tt-pretranslate-collapsed')?.addEventListener('change', ev => {
       void persistSettings({ pretranslateCollapsed: ev.target.checked });
+    });
+
+    el('tt-auto-translate-conv-title')?.addEventListener('change', ev => {
+      void persistSettings({ autoTranslateConversationTitle: ev.target.checked });
     });
 
     el('tt-target-lang')?.addEventListener('change', ev => {

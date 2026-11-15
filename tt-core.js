@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.5.0';
+  const PLUGIN_VERSION = '0.5.1';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';
@@ -251,6 +251,7 @@
     model: DEFAULT_MODEL,
     autoExpandHeight: true,
     pretranslateCollapsed: false,
+    autoTranslateConversationTitle: true,
     colorTheme: DEFAULT_COLOR_THEME
   };
 
@@ -298,6 +299,7 @@
       model,
       autoExpandHeight: src.autoExpandHeight !== false,
       pretranslateCollapsed: src.pretranslateCollapsed === true,
+      autoTranslateConversationTitle: src.autoTranslateConversationTitle !== false,
       colorTheme
     };
   }
