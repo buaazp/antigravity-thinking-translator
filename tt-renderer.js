@@ -20,6 +20,7 @@
     DEFAULT_SETTINGS,
     getColorThemeTokens,
     normalizeSettings,
+    mergeSettingsWithFallback,
     getEffectiveTargetLang,
     normalizeThinkingText,
     computeCanonicalCacheKey,
@@ -42,9 +43,11 @@
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
   const THEME_VARS_STYLE_ID = 'ag-tt-theme-vars';
   const HOST_ID = 'ag-thinking-translator';
+  const CLIENT_PREFS_STORAGE_KEY = 'ag_tt_client_prefs_v1';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
   const HOVER_DWELL_MS = 120;
+  const CONV_HOVER_HIDE_GRACE_MS = 220;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
@@ -79,6 +82,7 @@
   let unsubscribeReduxStore = null;
   let lastReduxSummarySig = '';
   let convHoverTimer = 0;
+  let convHideTimer = 0;
   let hoveredConvSegEl = null;
   let activeConvHoverSegEl = null;
   let convHoverBtnEl = null;
@@ -119,7 +123,7 @@
   const activeTasks = new Map(); // taskKey -> Task
 
   const TT_STYLES = ":host {\n  all: initial;\n  display: inline-flex;\n  align-items: center;\n  position: relative;\n  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\n  color: var(--tt-text);\n  -webkit-app-region: no-drag;\n  margin-right: 6px;\n  --tt-bg: rgba(255, 255, 255, 0.94);\n  --tt-bg-elevated: #ffffff;\n  --tt-bg-sub: #f4f5f7;\n  --tt-border: rgba(15, 23, 42, 0.12);\n  --tt-text: #111827;\n  --tt-text-muted: #6b7280;\n  --tt-accent: #438780;\n  --tt-accent-soft: rgba(67, 135, 128, 0.12);\n  --tt-accent-text: #2f6f68;\n  --tt-success: #438780;\n  --tt-warn: #f59e0b;\n  --tt-danger: #ef4444;\n  --tt-shadow: 0 12px 32px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);\n}\n\n:host([data-theme=\"dark\"]) {\n  --tt-bg: rgba(28, 30, 36, 0.94);\n  --tt-bg-elevated: #1e2028;\n  --tt-bg-sub: #272a34;\n  --tt-border: rgba(255, 255, 255, 0.12);\n  --tt-text: #f3f4f6;\n  --tt-text-muted: #9ca3af;\n  --tt-accent: #6ab0a8;\n  --tt-accent-soft: rgba(106, 176, 168, 0.16);\n  --tt-accent-text: #8ccac2;\n  --tt-shadow: 0 14px 36px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25);\n}\n\n:host([data-dock=\"fixed\"]) {\n  position: fixed;\n  top: 8px;\n  right: 260px;\n  z-index: 9998;\n}\n\n.tt-capsule {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  height: 24px;\n  padding: 0 9px;\n  border-radius: 999px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  user-select: none;\n  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;\n  white-space: nowrap;\n}\n\n.tt-capsule:hover {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n}\n\n.tt-capsule[aria-expanded=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n}\n\n.tt-dot {\n  width: 6px;\n  height: 6px;\n  border-radius: 50%;\n  background: var(--tt-text-muted);\n  flex-shrink: 0;\n}\n\n.tt-capsule[data-state=\"active\"] .tt-dot {\n  background: var(--tt-accent);\n}\n\n.tt-capsule[data-state=\"translating\"] .tt-dot {\n  background: var(--tt-accent);\n  animation: tt-pulse 1s ease-in-out infinite;\n}\n\n.tt-capsule[data-state=\"error\"] .tt-dot {\n  background: var(--tt-danger);\n}\n\n@keyframes tt-pulse {\n  0%, 100% { opacity: 1; transform: scale(1); }\n  50% { opacity: 0.45; transform: scale(0.8); }\n}\n\n.tt-popover {\n  position: fixed;\n  top: 42px;\n  right: 16px;\n  width: 344px;\n  max-width: calc(100vw - 24px);\n  background: var(--tt-bg-elevated);\n  border: 1px solid var(--tt-border);\n  border-radius: 12px;\n  box-shadow: var(--tt-shadow);\n  padding: 14px;\n  z-index: 2147483000;\n  display: none;\n  box-sizing: border-box;\n  font-size: 12px;\n  color: var(--tt-text);\n}\n\n.tt-popover[data-open=\"true\"] {\n  display: block;\n}\n\n.tt-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  margin-bottom: 12px;\n  padding-bottom: 8px;\n  border-bottom: 1px solid var(--tt-border);\n}\n\n.tt-title-wrap {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 13px;\n  font-weight: 600;\n}\n\n.tt-version {\n  font-size: 10px;\n  padding: 1px 5px;\n  border-radius: 999px;\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-close {\n  border: none;\n  background: transparent;\n  color: var(--tt-text-muted);\n  cursor: pointer;\n  font-size: 15px;\n  line-height: 1;\n  padding: 2px 5px;\n  border-radius: 6px;\n}\n\n.tt-close:hover {\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n}\n\n.tt-row {\n  margin-bottom: 10px;\n}\n\n.tt-row-inline {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 10px;\n}\n\n.tt-label {\n  display: block;\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  margin-bottom: 4px;\n  font-weight: 500;\n}\n\n.tt-label-inline {\n  font-size: 12px;\n  color: var(--tt-text);\n  font-weight: 500;\n}\n\n.tt-row-sub {\n  margin-top: -2px;\n  margin-bottom: 10px;\n  transition: opacity 140ms ease;\n}\n\n.tt-row-sub[data-disabled=\"true\"] {\n  opacity: 0.46;\n  pointer-events: none;\n}\n\n.tt-label-stack {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 0;\n}\n\n.tt-row-sub .tt-label-inline {\n  font-size: 11.5px;\n  font-weight: 400;\n  color: var(--tt-text);\n}\n\n.tt-subhint {\n  font-size: 10.5px;\n  line-height: 1.25;\n  color: var(--tt-text-muted);\n}\n\n.tt-select,\n.tt-input {\n  width: 100%;\n  box-sizing: border-box;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 12px;\n  outline: none;\n}\n\n.tt-select:focus,\n.tt-input:focus {\n  border-color: var(--tt-accent);\n}\n\n.tt-input-wrap {\n  margin-top: 6px;\n  display: none;\n}\n\n.tt-input-wrap[data-visible=\"true\"] {\n  display: block;\n}\n\n.tt-label-bar {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  margin-bottom: 4px;\n}\n\n.tt-label-bar .tt-label {\n  margin-bottom: 0;\n}\n\n.tt-link-btn {\n  border: none;\n  background: transparent;\n  padding: 1px 4px;\n  border-radius: 5px;\n  font-size: 11px;\n  font-weight: 500;\n  color: var(--tt-accent-text);\n  cursor: pointer;\n}\n\n.tt-link-btn:hover {\n  background: var(--tt-accent-soft);\n}\n\n.tt-link-btn:disabled {\n  opacity: 0.55;\n  cursor: default;\n}\n\n.tt-model-cascade {\n  display: grid;\n  grid-template-columns: 1.35fr 1fr;\n  gap: 6px;\n  align-items: end;\n}\n\n.tt-cascade-col {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  min-width: 0;\n}\n\n.tt-sublabel {\n  font-size: 10.5px;\n  color: var(--tt-text-muted);\n  line-height: 1.2;\n}\n\n.tt-seg {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 4px;\n  padding: 3px;\n  border-radius: 8px;\n  background: var(--tt-bg-sub);\n  border: 1px solid var(--tt-border);\n}\n\n.tt-seg-btn {\n  border: none;\n  border-radius: 6px;\n  padding: 5px 8px;\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n  background: transparent;\n  color: var(--tt-text-muted);\n  transition: background-color 120ms ease, color 120ms ease;\n}\n\n.tt-seg-btn[data-active=\"true\"] {\n  background: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-swatches {\n  display: grid;\n  grid-template-columns: repeat(3, minmax(0, 1fr));\n  gap: 6px;\n}\n\n.tt-swatch-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  min-width: 0;\n  padding: 6px 8px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text-muted);\n  font-size: 11.5px;\n  font-weight: 500;\n  line-height: 1;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n\n.tt-swatch-btn:hover {\n  border-color: var(--tt-accent);\n  color: var(--tt-text);\n}\n\n.tt-swatch-btn[data-active=\"true\"] {\n  border-color: var(--tt-accent);\n  background: var(--tt-accent-soft);\n  color: var(--tt-accent-text);\n  font-weight: 600;\n}\n\n.tt-swatch-dot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  flex-shrink: 0;\n  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);\n}\n\n.tt-switch {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  cursor: pointer;\n}\n\n.tt-switch input {\n  position: absolute;\n  opacity: 0;\n  width: 0;\n  height: 0;\n}\n\n.tt-slider {\n  width: 34px;\n  height: 18px;\n  border-radius: 999px;\n  background: var(--tt-border);\n  position: relative;\n  transition: background-color 140ms ease;\n}\n\n.tt-slider::after {\n  content: \"\";\n  position: absolute;\n  top: 2px;\n  left: 2px;\n  width: 14px;\n  height: 14px;\n  border-radius: 50%;\n  background: #ffffff;\n  transition: transform 140ms ease;\n}\n\n.tt-switch input:checked + .tt-slider {\n  background: var(--tt-accent);\n}\n\n.tt-switch input:checked + .tt-slider::after {\n  transform: translateX(16px);\n}\n\n.tt-actions {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px;\n  margin-top: 10px;\n}\n\n.tt-btn {\n  padding: 6px 10px;\n  border-radius: 7px;\n  border: 1px solid var(--tt-border);\n  background: var(--tt-bg-sub);\n  color: var(--tt-text);\n  font-size: 11.5px;\n  font-weight: 500;\n  cursor: pointer;\n}\n\n.tt-btn:hover {\n  border-color: var(--tt-accent);\n}\n\n.tt-btn-primary {\n  background: var(--tt-accent);\n  border-color: var(--tt-accent);\n  color: #ffffff;\n}\n\n.tt-btn-primary:hover {\n  filter: brightness(1.06);\n}\n\n.tt-footer {\n  margin-top: 10px;\n  padding-top: 8px;\n  border-top: 1px solid var(--tt-border);\n  font-size: 11px;\n  color: var(--tt-text-muted);\n  display: flex;\n  justify-content: space-between;\n  align-items: center;\n  gap: 8px;\n}\n";
-  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">翻译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.5.2</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译会话标题</span>\n      <span class=\"tt-subhint\">关闭时保持原版标题，悬停顶部标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-auto-translate-conv-title\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
+  const TT_TEMPLATE = "<button id=\"tt-capsule\" class=\"tt-capsule\" type=\"button\" aria-expanded=\"false\" data-state=\"active\" title=\"思考过程自动翻译设置\">\n  <span class=\"tt-dot\"></span>\n  <span id=\"tt-capsule-label\">翻译 · 简体中文</span>\n</button>\n\n<div id=\"tt-popover\" class=\"tt-popover\" data-open=\"false\" role=\"dialog\" aria-label=\"思考过程自动翻译设置\">\n  <div class=\"tt-header\">\n    <div class=\"tt-title-wrap\">\n      <span>思考过程翻译</span>\n      <span id=\"tt-version\" class=\"tt-version\">v0.5.3</span>\n    </div>\n    <button id=\"tt-close\" class=\"tt-close\" type=\"button\" title=\"关闭\">✕</button>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译思考过程</span>\n      <span class=\"tt-subhint\">关闭时保持原版无插件显示，悬停思考标题右侧可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-enabled\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div id=\"tt-pretranslate-row\" class=\"tt-row-inline tt-row-sub\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">预译未展开的折叠思考</span>\n      <span class=\"tt-subhint\">关闭可大幅省额度，标题仍优先自动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-pretranslate-collapsed\" type=\"checkbox\">\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row-inline\">\n    <div class=\"tt-label-stack\">\n      <span class=\"tt-label-inline\">自动翻译会话标题</span>\n      <span class=\"tt-subhint\">关闭时保持原版标题，悬停标题下方可手动翻译</span>\n    </div>\n    <label class=\"tt-switch\">\n      <input id=\"tt-auto-translate-conv-title\" type=\"checkbox\" checked>\n      <span class=\"tt-slider\"></span>\n    </label>\n  </div>\n\n  <div class=\"tt-row\">\n    <label class=\"tt-label\" for=\"tt-target-lang\">目标语言</label>\n    <select id=\"tt-target-lang\" class=\"tt-select\"></select>\n    <div id=\"tt-custom-lang-wrap\" class=\"tt-input-wrap\" data-visible=\"false\">\n      <input id=\"tt-custom-lang\" class=\"tt-input\" type=\"text\" placeholder=\"输入自定义目标语言，如：粤语 / Arabic\">\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">显示方式</span>\n    <div class=\"tt-seg\">\n      <button id=\"tt-mode-bilingual\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"bilingual\" data-active=\"true\">显示原文和译文</button>\n      <button id=\"tt-mode-translation\" class=\"tt-seg-btn\" type=\"button\" data-mode=\"translation_only\" data-active=\"false\">只显示译文</button>\n    </div>\n  </div>\n\n  <div class=\"tt-row\">\n    <span class=\"tt-label\">主题配色（莫兰迪色系）</span>\n    <div id=\"tt-color-swatches\" class=\"tt-swatches\" role=\"radiogroup\" aria-label=\"主题配色\"></div>\n  </div>\n\n  <div class=\"tt-row\">\n    <div class=\"tt-label-bar\">\n      <label class=\"tt-label\" for=\"tt-model-base\">翻译模型（复用 Antigravity 内置模型）</label>\n      <button id=\"tt-refresh-models\" class=\"tt-link-btn\" type=\"button\" title=\"从 agy models 刷新可用模型\">↻ 刷新</button>\n    </div>\n    <div class=\"tt-model-cascade\">\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">模型</span>\n        <select id=\"tt-model-base\" class=\"tt-select\" aria-label=\"翻译模型\"></select>\n      </div>\n      <div class=\"tt-cascade-col\">\n        <span class=\"tt-sublabel\">思考等级</span>\n        <select id=\"tt-model-level\" class=\"tt-select\" aria-label=\"思考等级\"></select>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"tt-actions\">\n    <button id=\"tt-translate-now\" class=\"tt-btn tt-btn-primary\" type=\"button\">立即翻译当前思考</button>\n    <button id=\"tt-clear-cache\" class=\"tt-btn\" type=\"button\">清空翻译缓存</button>\n  </div>\n\n  <div class=\"tt-footer\">\n    <span id=\"tt-status-text\">就绪</span>\n    <span id=\"tt-cache-stats\">缓存: 0</span>\n  </div>\n</div>\n";
 
   const host = document.createElement('div');
   host.id = HOST_ID;
@@ -488,15 +492,15 @@
         color: #ffffff;
       }
       .ag-tt-conv-title-btn {
-        flex-shrink: 0;
-        margin-left: 6px;
+        position: fixed;
+        z-index: 2147483100;
         display: inline-flex;
         align-items: center;
         gap: 4px;
-        height: 22px;
-        padding: 0 9px;
+        height: 24px;
+        padding: 0 10px;
         border-radius: 999px;
-        font-size: 11px;
+        font-size: 11.5px;
         line-height: 1;
         font-weight: 500;
         white-space: nowrap;
@@ -504,13 +508,21 @@
         user-select: none;
         -webkit-app-region: no-drag;
         app-region: no-drag;
-        backdrop-filter: blur(6px);
-        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
-        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        backdrop-filter: blur(8px);
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.34));
+        background: var(--ag-tt-elevated-bg, rgba(255, 255, 255, 0.96));
         color: var(--ag-tt-accent-text, #2f6f68);
-        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.14);
         animation: agTtHoverIn 140ms ease-out both;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+      }
+      .ag-tt-conv-title-btn::before {
+        content: "";
+        position: absolute;
+        left: -4px;
+        right: -4px;
+        top: -5px;
+        height: 5px;
       }
       .ag-tt-conv-title-btn:hover:not([disabled]) {
         background: var(--ag-tt-accent, #438780);
@@ -676,6 +688,7 @@
         --ag-tt-para-border: ${tokens.paraBorder};
         --ag-tt-para-bg: ${tokens.paraBg};
         --ag-tt-para-text: ${tokens.paraText};
+        --ag-tt-elevated-bg: ${isDark ? 'rgba(30, 32, 40, 0.96)' : 'rgba(255, 255, 255, 0.96)'};
       }
     `;
   }
@@ -1036,12 +1049,35 @@
     resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
+  function readClientPendingPrefs() {
+    try {
+      const raw = globalThis.localStorage?.getItem(CLIENT_PREFS_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function writeClientPendingPrefs(map) {
+    try {
+      const entries = Object.entries(map || {}).filter(([, v]) => v !== undefined);
+      if (!entries.length) {
+        globalThis.localStorage?.removeItem(CLIENT_PREFS_STORAGE_KEY);
+      } else {
+        globalThis.localStorage?.setItem(CLIENT_PREFS_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+      }
+    } catch {}
+  }
+
   async function persistSettings(partial) {
     const prevEnabled = settings.enabled;
     const prevConvAuto = settings.autoTranslateConversationTitle;
     const prevLang = getEffectiveTargetLang(settings);
     const prevModel = settings.model;
-    settings = normalizeSettings({ ...settings, ...partial });
+    const intended = normalizeSettings({ ...settings, ...partial });
+    settings = intended;
     if (prevEnabled && !settings.enabled) {
       deactivateAllToVanilla();
     } else if (!prevEnabled && settings.enabled) {
@@ -1064,8 +1100,20 @@
       trackedManualGroups.clear();
     }
     if (prevConvAuto !== settings.autoTranslateConversationTitle) {
-      hideConvTitleHoverButton();
-      if (settings.autoTranslateConversationTitle) {
+      hideConvTitleHoverButton(true);
+      if (!settings.autoTranslateConversationTitle) {
+        for (const st of convTitleStates.values()) {
+          if (st.activeTaskKey) {
+            detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+            st.activeTaskKey = '';
+            st.activeSubscriber = null;
+          }
+          if (st.status === 'queued' || st.status === 'translating') {
+            st.status = 'idle';
+            st.activeSourceKey = '';
+          }
+        }
+      } else {
         for (const st of convTitleStates.values()) {
           st.failedSourceKey = '';
         }
@@ -1074,9 +1122,19 @@
     renderSettingsUI();
 
     try {
-      const res = await callBridge('/save-settings', settings);
+      const res = await callBridge('/save-settings', intended);
       if (res && res.ok && res.settings) {
-        settings = normalizeSettings(res.settings);
+        const merged = mergeSettingsWithFallback(res.settings, intended);
+        settings = merged.settings;
+        const nextPending = readClientPendingPrefs();
+        for (const k of Object.keys(DEFAULT_SETTINGS)) {
+          if (merged.missingKeys.includes(k)) {
+            nextPending[k] = intended[k];
+          } else {
+            delete nextPending[k];
+          }
+        }
+        writeClientPendingPrefs(nextPending);
       }
     } catch (err) {
       lastErrorMsg = err?.message || String(err);
@@ -3637,17 +3695,34 @@
     return node.closest(HOVER_HEADER_SELECTOR);
   }
 
+  function clearConvHideTimer() {
+    if (convHideTimer) {
+      clearTimeout(convHideTimer);
+      convHideTimer = 0;
+    }
+  }
+
   function hideConvTitleHoverButton(force = false) {
     if (convHoverTimer) {
       clearTimeout(convHoverTimer);
       convHoverTimer = 0;
     }
+    clearConvHideTimer();
     if (convHoverTranslating && !force) return;
     hoveredConvSegEl = null;
     activeConvHoverSegEl = null;
     if (convHoverBtnEl && convHoverBtnEl.isConnected) {
       convHoverBtnEl.remove();
     }
+  }
+
+  function scheduleHideConvTitleHoverButton() {
+    clearConvHideTimer();
+    if (convHoverTranslating) return;
+    convHideTimer = setTimeout(() => {
+      convHideTimer = 0;
+      if (!disposed) hideConvTitleHoverButton(false);
+    }, CONV_HOVER_HIDE_GRACE_MS);
   }
 
   function resolveConvTitleHoverTarget(node) {
@@ -3666,8 +3741,7 @@
     const targetLang = getEffectiveTargetLang(settings);
     const targets = findConversationTitleTargets().filter(t => t.titlebar === titlebar);
     for (const t of targets) {
-      const strip = t.hostEl?.parentElement;
-      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node)) || (strip && strip.contains(node));
+      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node));
       if (!hitSeg) continue;
       if (!resolvePendingConvTitleSource(t, targetLang)) continue;
       const st = convTitleStates.get(t.stateKey);
@@ -3678,10 +3752,22 @@
     return null;
   }
 
+  function positionConvTitleHoverButton(segEl) {
+    if (!convHoverBtnEl || !segEl?.isConnected) return;
+    const rect = segEl.getBoundingClientRect();
+    const btnWidth = convHoverBtnEl.offsetWidth || 76;
+    const maxLeft = Math.max(8, (window.innerWidth || 1200) - btnWidth - 8);
+    const left = Math.max(8, Math.min(maxLeft, Math.round(rect.left)));
+    const top = Math.max(6, Math.round(rect.bottom + 4));
+    convHoverBtnEl.style.left = `${left}px`;
+    convHoverBtnEl.style.top = `${top}px`;
+  }
+
   function showConvTitleHoverButton(target) {
     if (disposed || !target || !target.segEl?.isConnected) return;
-    const hostEl = target.hostEl;
-    if (!hostEl || !hostEl.isConnected) return;
+    const mountRoot = document.body || document.documentElement;
+    if (!mountRoot) return;
+    clearConvHideTimer();
 
     if (!convHoverBtnEl) {
       convHoverBtnEl = document.createElement('button');
@@ -3692,9 +3778,16 @@
       const stop = ev => ev.stopPropagation();
       convHoverBtnEl.addEventListener('pointerdown', stop);
       convHoverBtnEl.addEventListener('mousedown', stop);
+      convHoverBtnEl.addEventListener('mouseenter', () => {
+        clearConvHideTimer();
+      });
+      convHoverBtnEl.addEventListener('mouseleave', () => {
+        if (!convHoverTranslating) scheduleHideConvTitleHoverButton();
+      });
       convHoverBtnEl.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
+        clearConvHideTimer();
         if (convHoverTranslating) return;
         const seg = activeConvHoverSegEl;
         const currentTarget = (seg && findConversationTitleTargets().find(t => t.segEl === seg)) || null;
@@ -3713,12 +3806,13 @@
     if (!convHoverTranslating) {
       convHoverBtnEl.disabled = false;
       convHoverBtnEl.removeAttribute('data-status');
-      convHoverBtnEl.textContent = '翻译';
+      convHoverBtnEl.textContent = '翻译标题';
     }
     activeConvHoverSegEl = target.segEl;
-    if (convHoverBtnEl.parentElement !== hostEl) {
-      hostEl.appendChild(convHoverBtnEl);
+    if (convHoverBtnEl.parentElement !== mountRoot) {
+      mountRoot.appendChild(convHoverBtnEl);
     }
+    positionConvTitleHoverButton(target.segEl);
   }
 
   async function triggerManualRegionTranslation(targetBtn, force = false) {
@@ -4179,7 +4273,11 @@
       const convTarget = resolveConvTitleHoverTarget(target);
       if (convTarget) {
         if (hoveredHeaderBtn || activeHoverTarget) hideHoverTranslateButton();
-        if (convTarget.segEl === activeConvHoverSegEl) return;
+        clearConvHideTimer();
+        if (convTarget.segEl === activeConvHoverSegEl) {
+          positionConvTitleHoverButton(convTarget.segEl);
+          return;
+        }
         if (convTarget.segEl === hoveredConvSegEl && convHoverTimer) return;
         hideConvTitleHoverButton();
         hoveredConvSegEl = convTarget.segEl;
@@ -4193,7 +4291,7 @@
         return;
       }
       if (hoveredConvSegEl || activeConvHoverSegEl) {
-        hideConvTitleHoverButton();
+        scheduleHideConvTitleHoverButton();
       }
 
       const btn = resolveHoverHeaderButton(target);
@@ -4221,7 +4319,7 @@
       if (hoveredConvSegEl || activeConvHoverSegEl) {
         const nextConv = resolveConvTitleHoverTarget(rel);
         if (!nextConv || (nextConv.segEl !== hoveredConvSegEl && nextConv.segEl !== activeConvHoverSegEl)) {
-          hideConvTitleHoverButton();
+          scheduleHideConvTitleHoverButton();
         }
       }
       if (!hoveredHeaderBtn && !activeHoverTarget) return;
@@ -4315,7 +4413,29 @@
     try {
       const res = await callBridge('/get-settings', {});
       if (res && res.ok && res.settings) {
-        settings = normalizeSettings(res.settings);
+        const pendingPrefs = readClientPendingPrefs();
+        const merged = mergeSettingsWithFallback(res.settings, pendingPrefs);
+        settings = merged.settings;
+
+        const nextPending = {};
+        let syncedPendingToBackend = false;
+        for (const [k, v] of Object.entries(pendingPrefs)) {
+          if (merged.missingKeys.includes(k)) {
+            nextPending[k] = v;
+          } else {
+            syncedPendingToBackend = true;
+          }
+        }
+        writeClientPendingPrefs(nextPending);
+
+        if (syncedPendingToBackend) {
+          try {
+            const syncRes = await callBridge('/save-settings', settings);
+            if (syncRes && syncRes.ok && syncRes.settings) {
+              settings = normalizeSettings(syncRes.settings);
+            }
+          } catch {}
+        }
       }
       if (res && res.cacheStats && typeof res.cacheStats.count === 'number') {
         cacheCount = res.cacheStats.count;
@@ -4370,6 +4490,7 @@
     if (disposed) return;
     disposed = true;
     hideHoverTranslateButton();
+    clearConvHideTimer();
     convHoverTranslating = false;
     hideConvTitleHoverButton(true);
     try { unsubscribeReduxStore?.(); } catch {}

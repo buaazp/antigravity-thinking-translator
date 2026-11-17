@@ -372,3 +372,24 @@ test('conversation title helpers skip placeholders and already-translated titles
   assert.equal(core.shouldTranslateConversationTitle('Untitled Conversation', '简体中文'), false);
   assert.equal(core.cleanConversationTitleTranslation('"克隆并安装 Unslop 仓库"\n多余说明'), '克隆并安装 Unslop 仓库');
 });
+
+test('mergeSettingsWithFallback preserves client fields stripped by older backend processes', () => {
+  const staleBackend = {
+    enabled: true,
+    targetLang: '简体中文',
+    customTargetLang: '',
+    displayMode: 'bilingual',
+    model: 'gemini-4-hydrogen-medium',
+    autoExpandHeight: true,
+    pretranslateCollapsed: false,
+    colorTheme: 'sage'
+  };
+  const mergedOff = core.mergeSettingsWithFallback(staleBackend, { autoTranslateConversationTitle: false });
+  assert.equal(mergedOff.settings.autoTranslateConversationTitle, false);
+  assert.ok(mergedOff.missingKeys.includes('autoTranslateConversationTitle'));
+
+  const upToDateBackend = { ...staleBackend, autoTranslateConversationTitle: true };
+  const mergedNew = core.mergeSettingsWithFallback(upToDateBackend, { autoTranslateConversationTitle: false });
+  assert.equal(mergedNew.settings.autoTranslateConversationTitle, true);
+  assert.deepEqual(mergedNew.missingKeys, []);
+});

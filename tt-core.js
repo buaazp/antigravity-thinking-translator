@@ -10,7 +10,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : (typeof window !== 'undefined' ? window : this), function () {
   'use strict';
 
-  const PLUGIN_VERSION = '0.5.2';
+  const PLUGIN_VERSION = '0.5.3';
   const DEFAULT_MODEL = 'gemini-4-hydrogen-medium';
   const DEFAULT_COLOR_THEME = 'celadon';
   const CUSTOM_LANG_VALUE = '__custom__';
@@ -301,6 +301,25 @@
       pretranslateCollapsed: src.pretranslateCollapsed === true,
       autoTranslateConversationTitle: src.autoTranslateConversationTitle !== false,
       colorTheme
+    };
+  }
+
+  function mergeSettingsWithFallback(backendRaw, fallbackOverrides = {}) {
+    const src = backendRaw && typeof backendRaw === 'object' ? backendRaw : {};
+    const fallback = fallbackOverrides && typeof fallbackOverrides === 'object' ? fallbackOverrides : {};
+    const merged = { ...src };
+    const missingKeys = [];
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (!Object.prototype.hasOwnProperty.call(src, key)) {
+        missingKeys.push(key);
+        if (Object.prototype.hasOwnProperty.call(fallback, key)) {
+          merged[key] = fallback[key];
+        }
+      }
+    }
+    return {
+      settings: normalizeSettings(merged),
+      missingKeys
     };
   }
 
@@ -1349,6 +1368,7 @@
     DEFAULT_SETTINGS,
     getColorThemeTokens,
     normalizeSettings,
+    mergeSettingsWithFallback,
     getEffectiveTargetLang,
     normalizeThinkingText,
     computeCacheKey,

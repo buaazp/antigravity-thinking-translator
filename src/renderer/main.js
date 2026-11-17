@@ -20,6 +20,7 @@
     DEFAULT_SETTINGS,
     getColorThemeTokens,
     normalizeSettings,
+    mergeSettingsWithFallback,
     getEffectiveTargetLang,
     normalizeThinkingText,
     computeCanonicalCacheKey,
@@ -42,9 +43,11 @@
   const GLOBAL_STYLE_ID = 'ag-tt-global-styles';
   const THEME_VARS_STYLE_ID = 'ag-tt-theme-vars';
   const HOST_ID = 'ag-thinking-translator';
+  const CLIENT_PREFS_STORAGE_KEY = 'ag_tt_client_prefs_v1';
   const LIVE_STREAM_PAUSE_MS = 1400;
   const STREAM_FRAME_INTERVAL_MS = 32;
   const HOVER_DWELL_MS = 120;
+  const CONV_HOVER_HIDE_GRACE_MS = 220;
   const MAX_CONCURRENT_BATCH_REQUESTS = 2;
   const TITLE_COALESCE_MS = 30;
   const PARA_COALESCE_MS = 45;
@@ -79,6 +82,7 @@
   let unsubscribeReduxStore = null;
   let lastReduxSummarySig = '';
   let convHoverTimer = 0;
+  let convHideTimer = 0;
   let hoveredConvSegEl = null;
   let activeConvHoverSegEl = null;
   let convHoverBtnEl = null;
@@ -487,15 +491,15 @@
         color: #ffffff;
       }
       .ag-tt-conv-title-btn {
-        flex-shrink: 0;
-        margin-left: 6px;
+        position: fixed;
+        z-index: 2147483100;
         display: inline-flex;
         align-items: center;
         gap: 4px;
-        height: 22px;
-        padding: 0 9px;
+        height: 24px;
+        padding: 0 10px;
         border-radius: 999px;
-        font-size: 11px;
+        font-size: 11.5px;
         line-height: 1;
         font-weight: 500;
         white-space: nowrap;
@@ -503,13 +507,21 @@
         user-select: none;
         -webkit-app-region: no-drag;
         app-region: no-drag;
-        backdrop-filter: blur(6px);
-        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.28));
-        background: var(--ag-tt-accent-soft, rgba(67, 135, 128, 0.12));
+        backdrop-filter: blur(8px);
+        border: 1px solid var(--ag-tt-badge-border, rgba(67, 135, 128, 0.34));
+        background: var(--ag-tt-elevated-bg, rgba(255, 255, 255, 0.96));
         color: var(--ag-tt-accent-text, #2f6f68);
-        box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.14);
         animation: agTtHoverIn 140ms ease-out both;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+      }
+      .ag-tt-conv-title-btn::before {
+        content: "";
+        position: absolute;
+        left: -4px;
+        right: -4px;
+        top: -5px;
+        height: 5px;
       }
       .ag-tt-conv-title-btn:hover:not([disabled]) {
         background: var(--ag-tt-accent, #438780);
@@ -675,6 +687,7 @@
         --ag-tt-para-border: ${tokens.paraBorder};
         --ag-tt-para-bg: ${tokens.paraBg};
         --ag-tt-para-text: ${tokens.paraText};
+        --ag-tt-elevated-bg: ${isDark ? 'rgba(30, 32, 40, 0.96)' : 'rgba(255, 255, 255, 0.96)'};
       }
     `;
   }
@@ -1035,12 +1048,35 @@
     resetAllTranslationStates({ clearMem: false, clearManual: true });
   }
 
+  function readClientPendingPrefs() {
+    try {
+      const raw = globalThis.localStorage?.getItem(CLIENT_PREFS_STORAGE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function writeClientPendingPrefs(map) {
+    try {
+      const entries = Object.entries(map || {}).filter(([, v]) => v !== undefined);
+      if (!entries.length) {
+        globalThis.localStorage?.removeItem(CLIENT_PREFS_STORAGE_KEY);
+      } else {
+        globalThis.localStorage?.setItem(CLIENT_PREFS_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+      }
+    } catch {}
+  }
+
   async function persistSettings(partial) {
     const prevEnabled = settings.enabled;
     const prevConvAuto = settings.autoTranslateConversationTitle;
     const prevLang = getEffectiveTargetLang(settings);
     const prevModel = settings.model;
-    settings = normalizeSettings({ ...settings, ...partial });
+    const intended = normalizeSettings({ ...settings, ...partial });
+    settings = intended;
     if (prevEnabled && !settings.enabled) {
       deactivateAllToVanilla();
     } else if (!prevEnabled && settings.enabled) {
@@ -1063,8 +1099,20 @@
       trackedManualGroups.clear();
     }
     if (prevConvAuto !== settings.autoTranslateConversationTitle) {
-      hideConvTitleHoverButton();
-      if (settings.autoTranslateConversationTitle) {
+      hideConvTitleHoverButton(true);
+      if (!settings.autoTranslateConversationTitle) {
+        for (const st of convTitleStates.values()) {
+          if (st.activeTaskKey) {
+            detachTaskSubscriber(st.activeTaskKey, st.activeSubscriber);
+            st.activeTaskKey = '';
+            st.activeSubscriber = null;
+          }
+          if (st.status === 'queued' || st.status === 'translating') {
+            st.status = 'idle';
+            st.activeSourceKey = '';
+          }
+        }
+      } else {
         for (const st of convTitleStates.values()) {
           st.failedSourceKey = '';
         }
@@ -1073,9 +1121,19 @@
     renderSettingsUI();
 
     try {
-      const res = await callBridge('/save-settings', settings);
+      const res = await callBridge('/save-settings', intended);
       if (res && res.ok && res.settings) {
-        settings = normalizeSettings(res.settings);
+        const merged = mergeSettingsWithFallback(res.settings, intended);
+        settings = merged.settings;
+        const nextPending = readClientPendingPrefs();
+        for (const k of Object.keys(DEFAULT_SETTINGS)) {
+          if (merged.missingKeys.includes(k)) {
+            nextPending[k] = intended[k];
+          } else {
+            delete nextPending[k];
+          }
+        }
+        writeClientPendingPrefs(nextPending);
       }
     } catch (err) {
       lastErrorMsg = err?.message || String(err);
@@ -3636,17 +3694,34 @@
     return node.closest(HOVER_HEADER_SELECTOR);
   }
 
+  function clearConvHideTimer() {
+    if (convHideTimer) {
+      clearTimeout(convHideTimer);
+      convHideTimer = 0;
+    }
+  }
+
   function hideConvTitleHoverButton(force = false) {
     if (convHoverTimer) {
       clearTimeout(convHoverTimer);
       convHoverTimer = 0;
     }
+    clearConvHideTimer();
     if (convHoverTranslating && !force) return;
     hoveredConvSegEl = null;
     activeConvHoverSegEl = null;
     if (convHoverBtnEl && convHoverBtnEl.isConnected) {
       convHoverBtnEl.remove();
     }
+  }
+
+  function scheduleHideConvTitleHoverButton() {
+    clearConvHideTimer();
+    if (convHoverTranslating) return;
+    convHideTimer = setTimeout(() => {
+      convHideTimer = 0;
+      if (!disposed) hideConvTitleHoverButton(false);
+    }, CONV_HOVER_HIDE_GRACE_MS);
   }
 
   function resolveConvTitleHoverTarget(node) {
@@ -3665,8 +3740,7 @@
     const targetLang = getEffectiveTargetLang(settings);
     const targets = findConversationTitleTargets().filter(t => t.titlebar === titlebar);
     for (const t of targets) {
-      const strip = t.hostEl?.parentElement;
-      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node)) || (strip && strip.contains(node));
+      const hitSeg = t.segEl.contains(node) || (t.hostEl && t.hostEl.contains(node));
       if (!hitSeg) continue;
       if (!resolvePendingConvTitleSource(t, targetLang)) continue;
       const st = convTitleStates.get(t.stateKey);
@@ -3677,10 +3751,22 @@
     return null;
   }
 
+  function positionConvTitleHoverButton(segEl) {
+    if (!convHoverBtnEl || !segEl?.isConnected) return;
+    const rect = segEl.getBoundingClientRect();
+    const btnWidth = convHoverBtnEl.offsetWidth || 76;
+    const maxLeft = Math.max(8, (window.innerWidth || 1200) - btnWidth - 8);
+    const left = Math.max(8, Math.min(maxLeft, Math.round(rect.left)));
+    const top = Math.max(6, Math.round(rect.bottom + 4));
+    convHoverBtnEl.style.left = `${left}px`;
+    convHoverBtnEl.style.top = `${top}px`;
+  }
+
   function showConvTitleHoverButton(target) {
     if (disposed || !target || !target.segEl?.isConnected) return;
-    const hostEl = target.hostEl;
-    if (!hostEl || !hostEl.isConnected) return;
+    const mountRoot = document.body || document.documentElement;
+    if (!mountRoot) return;
+    clearConvHideTimer();
 
     if (!convHoverBtnEl) {
       convHoverBtnEl = document.createElement('button');
@@ -3691,9 +3777,16 @@
       const stop = ev => ev.stopPropagation();
       convHoverBtnEl.addEventListener('pointerdown', stop);
       convHoverBtnEl.addEventListener('mousedown', stop);
+      convHoverBtnEl.addEventListener('mouseenter', () => {
+        clearConvHideTimer();
+      });
+      convHoverBtnEl.addEventListener('mouseleave', () => {
+        if (!convHoverTranslating) scheduleHideConvTitleHoverButton();
+      });
       convHoverBtnEl.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
+        clearConvHideTimer();
         if (convHoverTranslating) return;
         const seg = activeConvHoverSegEl;
         const currentTarget = (seg && findConversationTitleTargets().find(t => t.segEl === seg)) || null;
@@ -3712,12 +3805,13 @@
     if (!convHoverTranslating) {
       convHoverBtnEl.disabled = false;
       convHoverBtnEl.removeAttribute('data-status');
-      convHoverBtnEl.textContent = '翻译';
+      convHoverBtnEl.textContent = '翻译标题';
     }
     activeConvHoverSegEl = target.segEl;
-    if (convHoverBtnEl.parentElement !== hostEl) {
-      hostEl.appendChild(convHoverBtnEl);
+    if (convHoverBtnEl.parentElement !== mountRoot) {
+      mountRoot.appendChild(convHoverBtnEl);
     }
+    positionConvTitleHoverButton(target.segEl);
   }
 
   async function triggerManualRegionTranslation(targetBtn, force = false) {
@@ -4178,7 +4272,11 @@
       const convTarget = resolveConvTitleHoverTarget(target);
       if (convTarget) {
         if (hoveredHeaderBtn || activeHoverTarget) hideHoverTranslateButton();
-        if (convTarget.segEl === activeConvHoverSegEl) return;
+        clearConvHideTimer();
+        if (convTarget.segEl === activeConvHoverSegEl) {
+          positionConvTitleHoverButton(convTarget.segEl);
+          return;
+        }
         if (convTarget.segEl === hoveredConvSegEl && convHoverTimer) return;
         hideConvTitleHoverButton();
         hoveredConvSegEl = convTarget.segEl;
@@ -4192,7 +4290,7 @@
         return;
       }
       if (hoveredConvSegEl || activeConvHoverSegEl) {
-        hideConvTitleHoverButton();
+        scheduleHideConvTitleHoverButton();
       }
 
       const btn = resolveHoverHeaderButton(target);
@@ -4220,7 +4318,7 @@
       if (hoveredConvSegEl || activeConvHoverSegEl) {
         const nextConv = resolveConvTitleHoverTarget(rel);
         if (!nextConv || (nextConv.segEl !== hoveredConvSegEl && nextConv.segEl !== activeConvHoverSegEl)) {
-          hideConvTitleHoverButton();
+          scheduleHideConvTitleHoverButton();
         }
       }
       if (!hoveredHeaderBtn && !activeHoverTarget) return;
@@ -4314,7 +4412,29 @@
     try {
       const res = await callBridge('/get-settings', {});
       if (res && res.ok && res.settings) {
-        settings = normalizeSettings(res.settings);
+        const pendingPrefs = readClientPendingPrefs();
+        const merged = mergeSettingsWithFallback(res.settings, pendingPrefs);
+        settings = merged.settings;
+
+        const nextPending = {};
+        let syncedPendingToBackend = false;
+        for (const [k, v] of Object.entries(pendingPrefs)) {
+          if (merged.missingKeys.includes(k)) {
+            nextPending[k] = v;
+          } else {
+            syncedPendingToBackend = true;
+          }
+        }
+        writeClientPendingPrefs(nextPending);
+
+        if (syncedPendingToBackend) {
+          try {
+            const syncRes = await callBridge('/save-settings', settings);
+            if (syncRes && syncRes.ok && syncRes.settings) {
+              settings = normalizeSettings(syncRes.settings);
+            }
+          } catch {}
+        }
       }
       if (res && res.cacheStats && typeof res.cacheStats.count === 'number') {
         cacheCount = res.cacheStats.count;
@@ -4369,6 +4489,7 @@
     if (disposed) return;
     disposed = true;
     hideHoverTranslateButton();
+    clearConvHideTimer();
     convHoverTranslating = false;
     hideConvTitleHoverButton(true);
     try { unsubscribeReduxStore?.(); } catch {}
