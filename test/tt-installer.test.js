@@ -123,3 +123,70 @@ test('install and restore coexist cleanly with antigravity-context-viewer and pr
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('install and surgical restore support Antigravity 2.34+ await win.loadURL(url) anchor and coexist with context-viewer', async () => {
+  const prevTestMode = process.env.AG_TT_TEST_MODE;
+  const prevStateDir = process.env.AG_TT_STATE_DIR;
+  process.env.AG_TT_TEST_MODE = '1';
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-tt-asar-v234-'));
+  const stateDir = path.join(tmp, 'state');
+  process.env.AG_TT_STATE_DIR = stateDir;
+
+  try {
+    const srcDir = path.join(tmp, 'mock-src');
+    const distDir = path.join(srcDir, 'dist');
+    fs.mkdirSync(distDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name: 'antigravity', version: '2.34.0' }), 'utf8');
+    fs.writeFileSync(path.join(distDir, 'utils.js'), [
+      '"use strict";',
+      'function setupNodeWrapper(env) {',
+      '  return env;',
+      '}',
+      'async function invokeWindowLoadUrl(win, url) {',
+      '    try {',
+      '// --- Antigravity Context Meter utils Injection Start ---',
+      '    require("./meter-main").installContextMeter(win);',
+      '// --- Antigravity Context Meter utils Injection End ---',
+      '        await win.loadURL(url);',
+      '    } catch {}',
+      '}',
+      'module.exports = { setupNodeWrapper, invokeWindowLoadUrl };'
+    ].join('\n'), 'utf8');
+    fs.writeFileSync(path.join(distDir, 'preload.js'), [
+      '"use strict";',
+      'const electron_1 = require("electron");',
+      '// --- Antigravity Context Meter preload Injection Start ---',
+      'electron_1.contextBridge.exposeInMainWorld("contextMeterAPI", { scan: () => {} });',
+      '// --- Antigravity Context Meter preload Injection End ---'
+    ].join('\n'), 'utf8');
+    fs.writeFileSync(path.join(distDir, 'meter-main.js'), 'exports.installContextMeter = () => {};\n', 'utf8');
+
+    const asarPath = path.join(tmp, 'app.asar');
+    await createPackage(srcDir, asarPath, {});
+
+    const res = await install({ path: asarPath, stateDir, skipHotInject: true });
+    assert.equal(res.ok, true);
+    assert.equal(res.hostVersion, '2.34.0');
+
+    const utilsAfter = extractFile(asarPath, 'dist/utils.js').toString('utf8');
+    assert.ok(utilsAfter.includes('installThinkingTranslator'));
+    assert.ok(utilsAfter.includes('installContextMeter'));
+    assert.ok(utilsAfter.includes('        await win.loadURL(url);'));
+    assert.equal(verifyHostUtilsStructure(utilsAfter), true);
+
+    const restRes = await restore({ path: asarPath, stateDir, skipHotDispose: true });
+    assert.equal(restRes.ok, true);
+    assert.equal(restRes.mode, 'surgical');
+    const utilsRestored = extractFile(asarPath, 'dist/utils.js').toString('utf8');
+    assert.ok(!utilsRestored.includes('installThinkingTranslator'));
+    assert.ok(utilsRestored.includes('installContextMeter'));
+    assert.ok(utilsRestored.includes('        await win.loadURL(url);'));
+  } finally {
+    if (prevTestMode !== undefined) process.env.AG_TT_TEST_MODE = prevTestMode;
+    else delete process.env.AG_TT_TEST_MODE;
+    if (prevStateDir !== undefined) process.env.AG_TT_STATE_DIR = prevStateDir;
+    else delete process.env.AG_TT_STATE_DIR;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

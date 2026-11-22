@@ -11,7 +11,19 @@ const TAGS = {
 };
 
 const LOAD_URL_MARKER = '    void win.loadURL(url);';
+const LOAD_URL_MARKERS = [
+  LOAD_URL_MARKER,
+  '        await win.loadURL(url);'
+];
 const SETUP_NODE_MARKER = 'function setupNodeWrapper(env) {';
+
+function findLoadUrlMarker(utilsSource) {
+  if (!utilsSource || typeof utilsSource !== 'string') return null;
+  const matches = LOAD_URL_MARKERS.filter(m => utilsSource.includes(m));
+  if (matches.length !== 1) return null;
+  const marker = matches[0];
+  return utilsSource.split(marker).length === 2 ? marker : null;
+}
 
 function validateSyntax(code, filename = 'script.js') {
   if (typeof code !== 'string') return false;
@@ -59,14 +71,15 @@ function cleanPreloadSource(source) {
 
 function verifyHostUtilsStructure(utilsSource) {
   if (!utilsSource || typeof utilsSource !== 'string') return false;
-  const loadUrlCount = utilsSource.split(LOAD_URL_MARKER).length - 1;
+  const hasLoadUrl = Boolean(findLoadUrlMarker(utilsSource));
   const hasSetupNode = utilsSource.includes(SETUP_NODE_MARKER);
-  return loadUrlCount === 1 && hasSetupNode && validateSyntax(utilsSource, 'dist/utils.js');
+  return hasLoadUrl && hasSetupNode && validateSyntax(utilsSource, 'dist/utils.js');
 }
 
 function patchUtilsSource(source) {
   const cleaned = cleanUtilsSource(source);
-  if (!verifyHostUtilsStructure(cleaned)) {
+  const loadUrlMarker = findLoadUrlMarker(cleaned);
+  if (!loadUrlMarker || !verifyHostUtilsStructure(cleaned)) {
     throw new Error('dist/utils.js 缺少标准宿主加载标记或语法校验未通过，为保护客户端已中止写入。');
   }
   const hookBlock = [
@@ -75,7 +88,7 @@ function patchUtilsSource(source) {
     TAGS.UTILS_END
   ].join('\n');
 
-  const patched = cleaned.replace(LOAD_URL_MARKER, `${hookBlock}\n${LOAD_URL_MARKER}`);
+  const patched = cleaned.replace(loadUrlMarker, `${hookBlock}\n${loadUrlMarker}`);
   if (!verifyHostUtilsStructure(patched)) {
     throw new Error('注入 Thinking Translator 后的 dist/utils.js 结构或语法校验失败。');
   }
@@ -123,7 +136,9 @@ function patchPreloadSource(source) {
 module.exports = {
   TAGS,
   LOAD_URL_MARKER,
+  LOAD_URL_MARKERS,
   SETUP_NODE_MARKER,
+  findLoadUrlMarker,
   validateSyntax,
   hasThinkingTranslatorUtilsTrace,
   hasThinkingTranslatorPreloadTrace,
